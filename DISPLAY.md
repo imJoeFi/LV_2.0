@@ -184,27 +184,49 @@ Record what actually worked here once the panel is in hand.
 The Lightning QR UI should be built for a **720×720 square viewport**, not
 scaled down from a widescreen layout.
 
-Rough budget at 72.53 mm of glass:
+### Density
 
-- A QR at 640×640 px leaves a 40 px quiet-zone margin and lands at ~64 mm
-  square physically.
-- A 33×33 module QR (version 4, enough for a BOLT11 invoice at low ECC) gives
-  ~1.9 mm per module. Comfortably above the ~0.5 mm/module floor where phone
-  cameras start failing.
+The 33-module / ~1.9 mm-per-module estimate originally written here was
+optimistic — it assumed a much shorter payload than a real payment request.
 
-Screen states map to the inverted payment flow in `MDB_HACKING.md`:
+Budget for a 560 px QR card with a 44 px quiet zone, leaving 472 px of QR:
+
+| Payload length | Modules | mm/module |
+|---|---|---|
+| ~270 chars | 49 | **0.97** |
+| ~360 chars | 57 | **0.83** |
+
+Still above the ~0.5 mm floor where phone cameras start failing, but roughly
+half the original figure. Consequences:
+
+- The QR should get the entire vertical budget the layout can spare.
+- If the payload is case-insensitive, **uppercase it before encoding** — that
+  unlocks QR alphanumeric mode instead of byte mode, about 30% denser.
+- ECC level L. At this payload length anything higher costs modules the panel
+  does not have, and a customer can simply rescan.
+
+Payload length is the payment side's to control — see
+[`PAYMENT_INTERFACE.md`](PAYMENT_INTERFACE.md).
+
+### Screen states
+
+These follow the **select-first** flow confirmed on the bench in
+`MDB_HACKING.md`, so the MDB session leads and the screen follows — the opposite
+of what this section originally described.
 
 | State | Screen |
 |---|---|
-| Idle | Prompt / branding |
-| Invoice generated | QR + amount + countdown |
-| Settlement confirmed | Confirmation, then "make your selection" |
-| Session active | Credit remaining |
-| Vend complete | Thanks, return to idle |
+| Idle | Branding, "Make your selection" (MDB session armed) |
+| Vend request | Selection + price + QR + countdown |
+| Settled | "Payment received", then "Dispensing" |
+| Vend complete | "Enjoy", return to idle |
+| Deadline hit | "Payment timed out — nothing was charged" |
+| Paid but not dispensed | Apology + support contact |
+| Link down | "Temporarily out of service" |
 
-Remember the ordering constraint: **the QR is displayed and paid before
-`03 Begin Session` is sent.** The screen leads the MDB session, not the
-other way around.
+Note the open problem in `MDB_HACKING.md`: while the MDB session is armed, the
+machine's **own** 16×1 display advertises a credit nobody has paid. This panel
+cannot fix that — it needs solving on the MDB side.
 
 ---
 
@@ -214,8 +236,11 @@ other way around.
 - [ ] Confirm 720×720 auto-detects on Pi 5 / Bookworm with no config
 - [ ] Measure assembled depth behind the door skin; confirm it clears the
       VE5801 UCB and the existing wiring loom
-- [ ] Decide whether to keep touch at all — a pure QR display needs no input,
-      and disabling touch removes a failure mode on a public machine
+- [ ] Decide whether to keep touch at all — leaning **no**, since the flow needs
+      no customer input (the machine's own buttons are the only control
+      surface) and disabling touch removes a failure mode on a public machine.
+      Held open because one candidate fix for the fake-credit problem in
+      `MDB_HACKING.md` is a presence trigger, which might want a tap.
 
 ---
 

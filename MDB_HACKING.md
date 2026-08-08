@@ -144,35 +144,129 @@ already up will see nothing. Always capture across a power cycle.
 | VMC → Pi | `17 00 ...` | Peripheral ID request |
 | VMC → Pi | `14 01 15` | Reader enable |
 | **Pi → VMC** | **`03 <funds hi> <funds lo> <cks>`** | **Begin Session — credit available** |
-| VMC → Pi | `13 00 <price> <item> <cks>` | Vend request |
+| VMC → Pi | `13 00 <price hi> <price lo> <row> <col> <cks>` | Vend request |
 | **Pi → VMC** | **`05 <price hi> <price lo> <cks>`** | **Vend approved** |
 | Pi → VMC | `06 <cks>` | Vend denied |
-| VMC → Pi | `13 02 ...` | Vend success (product dispensed) |
-| VMC → Pi | `13 04 ...` | Session complete |
-| Pi → VMC | `06 06` | Ack |
+| Pi → VMC | `07 <cks>` | End session |
+| VMC → Pi | `13 02 <row> <col> <cks>` | Vend success (product dispensed) |
+| VMC → Pi | `13 03 <cks>` | Vend failure / gave up waiting |
+| VMC → Pi | `13 04 <cks>` | Session complete |
+| Pi → VMC | `06 06` | Ack session complete |
 
 `05 <price>` is the single line that authorizes a vend. In the finished system
-it is gated on BTCPay invoice settlement.
+it is gated on confirmation from the payment side — see
+[`PAYMENT_INTERFACE.md`](PAYMENT_INTERFACE.md).
 
 ---
 
-## Design note: payment must come BEFORE credit
+## Bench results, 2026-08-08
 
-MDB gives the reader only a few seconds to answer a vend request. A Lightning
-payment takes far longer. Holding the approval while waiting for settlement will
-time out and cancel the session.
+All measured on the real machine with `mdb/mdb_flow_test.py`. These supersede
+any earlier guesses in this file.
 
-**Invert the flow:**
+### The flow works: select first, pay the exact price
 
-1. Idle — display a Lightning QR
-2. Customer scans and pays
-3. BTCPay confirms settlement
-4. **Then** send Begin Session with the credit amount
-5. Machine displays credit; customer selects
-6. Vend request arrives → approve **immediately**
-7. Session complete
+```
+  07        END SESSION            clear any stale session first -- see below
+  03 0541   BEGIN SESSION          credit >= the machine's max price
+              v  customer presses a selection
+  13 00 04 e3 00 01                A1, price 1251
+              v  payment happens here, in our own time
+  05 04 e3  VEND APPROVED
+  13 02 00 01                      VEND SUCCESS, echoes the item vended
+  13 04     SESSION COMPLETE
+  06 06     ack, then re-arm
+```
 
-This is how commercial QR-based readers work and it avoids the timeout entirely.
+Confirmed end to end: the item dispensed.
+
+### The vend-request window is 60 seconds
+
+Measured three times by staying silent after `13 00`: **60.066 s, 59.865 s,
+60.065 s.** The VMC then sends `13 03`, followed ~200 ms later by `13 04`.
+
+Answer by **45 s**, not 60. At 60 we raced the machine by 217 ms and sent
+`06 VEND DENIED` into a session it had already closed.
+
+### The item field is row/column, not a number
+
+`13 00 <price hi> <price lo> <row> <col>`. The last two bytes are *not* a 16-bit
+integer — they are the tray and the position within it.
+
+| Bytes | Selection |
+|---|---|
+| `00 01` | A1 |
+| `01 02` | B2 |
+| `02 03` | C3 |
+| `04 05` | E5 |
+
+`13 02` echoes the same two bytes, so the machine confirms *which* item it vended.
+
+### Prices are scaled by 10 — they are not cents
+
+    dollars = raw * scale / 10^decimals = raw * 10 / 100 = raw / 10
+
+Proved by sending funds `1345` and watching the machine display **$134.50**.
+This matches the `0A` (scale factor 10) and `02` (decimal places) bytes in the
+reader's stored config, `01 01 09 72 0A 02 07 0D`.
+
+So the power-on MAX/MIN PRICE of `0x0541` / `0x0032` means **$134.50 / $5.00**,
+and A1's `1251` is **$125.10**. Those are clearly not snack prices — the
+machine's own prices need setting via `SET PRICE` in the service menu.
+
+### `0xFFFF` is NOT honoured as "funds unknown"
+
+The VMC displays it literally, as **$655.35**. Selections still work, because
+everything is affordable at that figure, but a machine advertising a fake
+$655.35 balance is not shippable.
+
+Send a real credit figure instead, at least the machine's max price (`0x0541`).
+Anything lower makes the dearest selections unaffordable.
+
+### Sessions must be explicitly closed
+
+A session left open parks the machine on its credit display and it stops
+accepting selections. It survives the controlling script exiting. **Always send
+`07 END SESSION` before arming a new one** — `mdb_flow_test.py` does this at the
+top of every round, and it is the difference between a machine that recovers and
+one that looks bricked.
+
+### Every branch, and what the machine does
+
+| Branch | Machine's response | Outcome |
+|---|---|---|
+| `05` approve | `13 02 <row> <col>` → `13 04` | Vends. Clean |
+| `06` decline, session still live | `00` ack → `13 04` | No vend, re-arms clean |
+| No answer for 60 s | `13 03` → `13 04` | No vend, re-arms clean |
+| Selection on an empty slot | Machine shows `NOT AVAILABLE`, **no `13 00` at all** | Cashless never consulted |
+
+That last row matters: the VMC blocks known-empty selections itself, so the
+"customer pays and nothing drops" case cannot arise from an empty slot. The
+remaining exposure is a slot the machine believes is stocked that jams anyway.
+
+---
+
+## Open problem: an armed session shows a fake credit
+
+To let a customer select *before* paying, the machine must first be told they
+have credit. So an idle, armed machine permanently displays a balance nobody
+has paid — `$134.50` in testing.
+
+It is not exploitable, since nothing vends without our `05`. But it invites
+button-pressing, and each press locks the session for the full window.
+
+Three ways out, none yet tested:
+
+1. **Does the VMC report a selection with no session open?** If it does, stay
+   disarmed at idle and arm only once we know what they picked. Unlikely under
+   MDB, but cheap to check and it would remove the problem entirely.
+2. **Display Request (`02 <duration> <32 chars>`).** MDB lets the reader push
+   text to the VMC's 16×1. If this VMC honours it, the screen can read
+   `SCAN TO PAY` instead of a balance.
+3. **A presence trigger.** Arm only when someone is actually there — a button or
+   sensor — so the fake credit shows for seconds rather than permanently.
+
+---
 
 **Customer-facing screen:** the AP 113's display is 16×1 characters — far too
 small for a QR code, so a separate screen is required. The 1.0 ESP32 design
@@ -194,6 +288,17 @@ In `mdb/`:
 | `mdb_listen.py` | Passive capture with timestamps. Run across a machine power cycle. |
 | `mdb_send_test.py` | Checksum probe — proves the send framing. Expect `9D`. |
 | `mdb_vend.py` | Opens a session and auto-approves the vend request. **Vends for real.** |
+| `mdb_vend_unknown_amount.py` | Early select-first bench script. Superseded by `mdb_flow_test.py`; note it uses funds `FFFF`, which this VMC mishandles. **Vends for real.** |
+| **`mdb_flow_test.py`** | **The current harness.** Full flow with the payment step faked as a y/n prompt. Loops, closes sessions properly, decodes row/column selections. **Vends for real on `y`.** |
+
+Typical run:
+
+```bash
+python3 mdb/mdb_flow_test.py --port /dev/serial/by-id/usb-Prolific* --funds 1345
+```
+
+`--funds 1345` is the machine's max price. `--clear` sends `07 END SESSION` and
+exits, which unsticks a machine parked on a credit display.
 
 ---
 
