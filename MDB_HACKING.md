@@ -174,10 +174,14 @@ time out and cancel the session.
 
 This is how commercial QR-based readers work and it avoids the timeout entirely.
 
-**Open hardware question:** the AP 113's display is 16×1 characters — far too
-small for a QR code. A separate customer-facing screen is required. `PROJECT.md`
-specs a 2.13" e-ink for the earlier ESP32 design; it could be driven from the Pi
-instead, though QR scannability at that size was already flagged as a risk.
+**Customer-facing screen:** the AP 113's display is 16×1 characters — far too
+small for a QR code, so a separate screen is required. The 1.0 ESP32 design
+specced a 2.13" e-ink (`1.0/Code/PROJECT.md`), but QR scannability at that size
+was flagged as a risk.
+
+Resolved for 2.0 with a **Waveshare 4inch HDMI LCD (C)**, 720×720 — square, so
+the whole panel is usable QR. It mounts in the door opening left by the removed
+bill mech. See [`DISPLAY.md`](DISPLAY.md).
 
 ---
 
