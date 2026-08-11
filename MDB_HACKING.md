@@ -290,11 +290,19 @@ In `mdb/`:
 | `mdb_vend.py` | Opens a session and auto-approves the vend request. **Vends for real.** |
 | `mdb_vend_unknown_amount.py` | Early select-first bench script. Superseded by `mdb_flow_test.py`; note it uses funds `FFFF`, which this VMC mishandles. **Vends for real.** |
 | **`mdb_flow_test.py`** | **The current harness.** Full flow with the payment step faked as a y/n prompt. Loops, closes sessions properly, decodes row/column selections. **Vends for real on `y`.** |
+| **`mdb-flow-test` (Rust)** | Rust port of `mdb_flow_test.py` with the same serial framing, interactive payment prompt, session cleanup, and result logging. Entry point: `src/bin/mdb_flow_test.rs`; flow and protocol modules live under `src/`. **Vends for real on `y`.** |
 
 Typical run:
 
 ```bash
 python3 mdb/mdb_flow_test.py --port /dev/serial/by-id/usb-Prolific* --funds 1345
+```
+
+Rust equivalent:
+
+```bash
+cargo run --release --bin mdb-flow-test -- \
+  --port /dev/serial/by-id/usb-Prolific* --funds 1345
 ```
 
 `--funds 1345` is the machine's max price. `--clear` sends `07 END SESSION` and

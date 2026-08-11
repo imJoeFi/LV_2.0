@@ -1,0 +1,25 @@
+[package]
+name = "lv-mdb-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mdb-flow-test"
+path = "src/bin/mdb_flow_test.rs"
+
+[dependencies]
+chrono = "0.4.45"
+clap = { version = "4.5.48", features = ["derive"] }
+ctrlc = "3.5.2"
+hex = "0.4.3"
+nix = { version = "0.31.3", features = ["poll", "term"] }
+parse_int = "0.9.0"
+serialport = { version = "4.9.0", default-features = false }
+
+[lints.clippy]
+nursery = "deny"
+pedantic = "deny"
+missing_const_for_fn = { level = "allow", priority = 1 }
+missing_errors_doc = { level = "allow", priority = 1 }
+must_use_candidate = { level = "allow", priority = 1 }

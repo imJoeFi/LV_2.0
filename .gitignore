@@ -1,3 +1,4 @@
 ﻿config.h
 .env
 __pycache__/
+target/
