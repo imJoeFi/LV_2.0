@@ -1,0 +1,47 @@
+# Product identities are stable. Promo codes grant products, while physical
+# slots point at the product they currently contain.
+
+[[products]]
+id = "sparkling-water"
+name = "Sparkling Water"
+# Optional paths are relative to this catalog file. PNG and JPEG are supported.
+# image = "images/sparkling-water.png"
+
+[[products]]
+id = "event-pin"
+name = "Event Enamel Pin"
+
+[[products]]
+id = "trail-mix"
+name = "Trail Mix"
+
+[[products]]
+id = "cold-brew"
+name = "Cold Brew"
+
+[[slots]]
+id = "A1"
+product = "sparkling-water"
+payment = "promo"
+
+[[slots]]
+id = "A2"
+product = "sparkling-water"
+payment = "promo"
+
+[[slots]]
+id = "A3"
+product = "event-pin"
+payment = "promo"
+
+[[slots]]
+id = "B1"
+product = "trail-mix"
+payment = "lightning"
+price_cents = 250
+
+[[slots]]
+id = "B2"
+product = "cold-brew"
+payment = "lightning"
+price_cents = 400

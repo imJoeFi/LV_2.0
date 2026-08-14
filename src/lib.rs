@@ -3,6 +3,7 @@ compile_error!("lv-mdb-tools currently requires a Unix-like operating system");
 
 mod device;
 mod harness;
+pub mod kiosk;
 mod link;
 mod protocol;
 mod terminal;

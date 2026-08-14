@@ -2,3 +2,5 @@
 .env
 __pycache__/
 target/
+/*.redb
+/*.redb-lock
