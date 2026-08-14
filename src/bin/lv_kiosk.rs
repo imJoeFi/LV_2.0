@@ -1,3 +1,6 @@
+#[path = "lv_kiosk/mdb.rs"]
+mod mdb;
+
 use clap::Parser;
 use iced::widget::{
     button, column, container, image, rich_text, row, scrollable, span, text, Column, Row,
@@ -7,6 +10,10 @@ use lv_mdb_tools::kiosk::{
     ArmMode, Catalog, KioskEngine, MachineSelection, PaymentKind, PaymentPolicy, Product,
     PromoCode, SelectionOutcome, SlotHealth, SlotId, StateStore, TransactionId, TransactionStatus,
 };
+use lv_mdb_tools::{
+    ItemNumber, Level1Amount, MdbConfig, SessionEndReason, VendDecisionError, VendId,
+};
+use mdb::{ControllerEvent, DecisionFailure, MdbController};
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -16,10 +23,20 @@ const LIGHTNING_TIMEOUT: Duration = Duration::from_secs(45);
 const RATE_LIMIT_RESET: Duration = Duration::from_secs(60);
 const RATE_LIMIT_DELAY: Duration = Duration::from_secs(3);
 const ADMIN_LOCKOUT: Duration = Duration::from_secs(30);
+const MDB_APPLICATION_RESPONSE_TIME: Duration = Duration::from_secs(46);
+const MDB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
-#[command(about = "Portrait LightningVEND kiosk UI (simulated MDB backend)")]
+#[command(about = "Portrait LightningVEND kiosk UI")]
 struct Args {
+    /// Serial port connected to the WAFER RS232-MDB adapter. Omit for simulation mode.
+    #[arg(long, value_name = "PATH")]
+    port: Option<PathBuf>,
+
+    /// Serial baud rate. The PC2MDB adapter normally uses 9600.
+    #[arg(long, default_value_t = 9600)]
+    baud: u32,
+
     /// Product, slot, payment policy, and price configuration.
     #[arg(long, default_value = "config/kiosk.toml")]
     catalog: PathBuf,
@@ -40,7 +57,7 @@ struct Args {
     #[arg(long)]
     fullscreen: bool,
 
-    /// Shared admin PIN for this simulator milestone.
+    /// Shared admin PIN.
     #[arg(long, default_value = "2468")]
     admin_pin: String,
 }
@@ -56,7 +73,7 @@ fn main() -> iced::Result {
     )
     .subscription(ApplicationState::subscription)
     .theme(Theme::Dark)
-    .title("LightningVEND kiosk simulator")
+    .title("LightningVEND kiosk")
     .window(window::Settings {
         size: Size::new(480.0, 800.0),
         fullscreen,
@@ -106,7 +123,17 @@ impl ApplicationState {
 
     fn subscription(&self) -> Subscription<Message> {
         match self {
-            Self::Running(_) => time::every(Duration::from_secs(1)).map(Message::Tick),
+            Self::Running(app) => {
+                let clock = time::every(Duration::from_secs(1)).map(Message::Tick);
+                if app.is_hardware() {
+                    Subscription::batch([
+                        clock,
+                        time::every(MDB_POLL_INTERVAL).map(|_| Message::PollMdb),
+                    ])
+                } else {
+                    clock
+                }
+            }
             Self::Failed(_) => Subscription::none(),
         }
     }
@@ -115,6 +142,9 @@ impl ApplicationState {
 struct KioskApp {
     engine: KioskEngine,
     store: StateStore,
+    backend: Backend,
+    machine_status: MachineStatus,
+    active_mdb_vend: Option<ActiveMdbVend>,
     admin_pin: String,
     page: Page,
     promo_input: String,
@@ -127,6 +157,32 @@ struct KioskApp {
     next_code_attempt: Option<Instant>,
     invalid_admin_attempts: u32,
     admin_locked_until: Option<Instant>,
+}
+
+enum Backend {
+    Simulator,
+    Hardware(MdbController),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MachineStatus {
+    Simulator,
+    Connecting,
+    Ready,
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveMdbVend {
+    vend_id: VendId,
+    transaction_id: TransactionId,
+    approval_sent: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MdbVendRequest {
+    vend_id: VendId,
+    requested_price: Level1Amount,
 }
 
 #[derive(Clone)]
@@ -171,6 +227,7 @@ enum SimulatedVendResult {
 #[derive(Debug, Clone)]
 enum Message {
     Tick(Instant),
+    PollMdb,
     OpenPromo,
     PromoDigit(char),
     PromoBackspace,
@@ -221,10 +278,23 @@ impl KioskApp {
         store
             .save(engine.state())
             .map_err(|error| error.to_string())?;
+        let (backend, machine_status) = match &args.port {
+            Some(port) => {
+                let config = MdbConfig::new(port.clone(), args.baud)
+                    .with_application_response_time(MDB_APPLICATION_RESPONSE_TIME);
+                let controller = MdbController::spawn(config)
+                    .map_err(|error| format!("could not start the MDB controller: {error}"))?;
+                (Backend::Hardware(controller), MachineStatus::Connecting)
+            }
+            None => (Backend::Simulator, MachineStatus::Simulator),
+        };
         let now = Instant::now();
         Ok(Self {
             engine,
             store,
+            backend,
+            machine_status,
+            active_mdb_vend: None,
             admin_pin: args.admin_pin.clone(),
             page: Page::Ready,
             promo_input: String::new(),
@@ -246,6 +316,7 @@ impl KioskApp {
     fn update(&mut self, message: Message) {
         match message {
             Message::Tick(now) => self.tick(now),
+            Message::PollMdb => self.poll_mdb(),
             Message::OpenPromo => {
                 self.promo_input.clear();
                 self.notice = None;
@@ -287,7 +358,7 @@ impl KioskApp {
                 self.page = Page::Ready;
                 self.notice = None;
             }
-            Message::MachineSelected(slot) => self.machine_selected(&slot),
+            Message::MachineSelected(slot) => self.machine_selected(&slot, None),
             Message::LightningAccepted(id) => self.lightning_accepted(id),
             Message::LightningCancelled(id) => self.lightning_cancelled(id),
             Message::SimulatedVend(id, result) => self.simulated_vend(id, result),
@@ -330,19 +401,180 @@ impl KioskApp {
                 }
             }
             Message::ResolveUncertain(id, dispensed) => {
-                match self.engine.resolve_uncertain(id, dispensed) {
-                    Ok(()) => {
-                        self.notice = Some(if dispensed {
-                            "Transaction marked dispensed; inventory and entitlement updated."
-                                .to_owned()
-                        } else {
-                            "Transaction marked not dispensed; reservation released.".to_owned()
-                        });
-                        self.persist();
-                    }
-                    Err(error) => self.notice = Some(error.to_string()),
+                self.resolve_uncertain(id, dispensed);
+            }
+        }
+    }
+
+    const fn is_hardware(&self) -> bool {
+        matches!(self.backend, Backend::Hardware(_))
+    }
+
+    fn poll_mdb(&mut self) {
+        let mut events = Vec::new();
+        if let Backend::Hardware(controller) = &mut self.backend {
+            while let Some(event) = controller.try_event() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.handle_mdb_event(event);
+        }
+    }
+
+    fn handle_mdb_event(&mut self, event: ControllerEvent) {
+        match event {
+            ControllerEvent::Connecting => self.machine_status = MachineStatus::Connecting,
+            ControllerEvent::SessionReady => {
+                let reconnected = matches!(self.machine_status, MachineStatus::Unavailable(_));
+                self.machine_status = MachineStatus::Ready;
+                if reconnected {
+                    self.notice = Some("Vending machine reconnected and ready.".to_owned());
                 }
             }
+            ControllerEvent::VendRequested {
+                vend_id,
+                item,
+                requested_price,
+            } => self.mdb_vend_requested(
+                MdbVendRequest {
+                    vend_id,
+                    requested_price,
+                },
+                item,
+            ),
+            ControllerEvent::VendCancelled { vend_id } => {
+                self.cancel_mdb_transaction(
+                    vend_id,
+                    "The vending machine cancelled the selection.",
+                );
+            }
+            ControllerEvent::VendDecisionExpired { vend_id, error } => {
+                self.cancel_mdb_transaction(
+                    vend_id,
+                    &format!("The vending machine selection expired: {error}"),
+                );
+            }
+            ControllerEvent::DecisionAccepted { vend_id } => {
+                if self
+                    .active_mdb_vend
+                    .is_some_and(|active| active.vend_id == vend_id)
+                {
+                    eprintln!("MDB vend decision accepted by the local device actor: {vend_id}");
+                }
+            }
+            ControllerEvent::DecisionFailed { vend_id, error } => {
+                let uncertain =
+                    matches!(error, DecisionFailure::Mdb(VendDecisionError::Disconnected));
+                if uncertain
+                    && self
+                        .active_mdb_vend
+                        .is_some_and(|active| active.vend_id == vend_id && active.approval_sent)
+                {
+                    self.finish_mdb_vend(
+                        vend_id,
+                        SimulatedVendResult::Uncertain,
+                        "The MDB connection was lost while approving the vend.",
+                    );
+                } else {
+                    self.cancel_mdb_transaction(
+                        vend_id,
+                        &format!("The vend could not be authorized: {error:?}"),
+                    );
+                }
+            }
+            ControllerEvent::VendSucceeded {
+                vend_id,
+                reported_item,
+            } => {
+                if let Some(item) = reported_item {
+                    eprintln!("MDB reported successful item {item}");
+                }
+                self.finish_mdb_vend(
+                    vend_id,
+                    SimulatedVendResult::Success,
+                    "The vending machine reported a successful dispense.",
+                );
+            }
+            ControllerEvent::VendFailed { vend_id } => self.finish_mdb_vend(
+                vend_id,
+                SimulatedVendResult::Failure,
+                "The vending machine could not dispense the item.",
+            ),
+            ControllerEvent::SessionEnded { reason } => self.mdb_session_ended(reason),
+            ControllerEvent::Unavailable(error) => {
+                self.machine_status = MachineStatus::Unavailable(error);
+                if let Some(active) = self.active_mdb_vend {
+                    if active.approval_sent {
+                        self.finish_mdb_vend(
+                            active.vend_id,
+                            SimulatedVendResult::Uncertain,
+                            "The MDB connection was lost after vend approval.",
+                        );
+                    } else {
+                        self.cancel_mdb_transaction(
+                            active.vend_id,
+                            "The MDB connection was lost before authorization.",
+                        );
+                    }
+                }
+            }
+            ControllerEvent::Fault(error) => self.notice = Some(format!("MDB warning: {error}")),
+        }
+    }
+
+    fn mdb_vend_requested(&mut self, request: MdbVendRequest, item: ItemNumber) {
+        if self.active_mdb_vend.is_some() {
+            self.deny_mdb(request.vend_id);
+            self.notice =
+                Some("The machine requested another vend while one was active.".to_owned());
+            return;
+        }
+        let [row, column] = item.bytes();
+        let slot = match SlotId::from_ap113(row, column) {
+            Ok(slot) => slot,
+            Err(error) => {
+                self.deny_mdb(request.vend_id);
+                self.notice = Some(format!("Unsupported machine selection {item}: {error}"));
+                return;
+            }
+        };
+        eprintln!(
+            "MDB selected {slot}; ignoring requested price {} in favor of kiosk policy",
+            request.requested_price.raw()
+        );
+        self.machine_selected(&slot, Some(request));
+    }
+
+    fn mdb_session_ended(&mut self, reason: SessionEndReason) {
+        let Some(active) = self.active_mdb_vend else {
+            return;
+        };
+        if active.approval_sent {
+            self.finish_mdb_vend(
+                active.vend_id,
+                SimulatedVendResult::Uncertain,
+                &format!("The MDB session ended without a vend result ({reason:?})."),
+            );
+        } else {
+            self.cancel_mdb_transaction(
+                active.vend_id,
+                &format!("The vending machine ended the selection ({reason:?})."),
+            );
+        }
+    }
+
+    fn resolve_uncertain(&mut self, id: TransactionId, dispensed: bool) {
+        match self.engine.resolve_uncertain(id, dispensed) {
+            Ok(()) => {
+                self.notice = Some(if dispensed {
+                    "Transaction marked dispensed; inventory and entitlement updated.".to_owned()
+                } else {
+                    "Transaction marked not dispensed; reservation released.".to_owned()
+                });
+                self.persist();
+            }
+            Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
@@ -377,11 +609,10 @@ impl KioskApp {
             _ => None,
         };
         if let Some(id) = expired_lightning {
-            if self.engine.cancel_lightning(id).is_ok() {
-                self.persist();
-            }
-            self.page = Page::Ready;
-            self.notice = Some("Lightning payment timed out. No payment was taken.".to_owned());
+            self.cancel_lightning_with_notice(
+                id,
+                "Lightning payment timed out. No payment was taken.",
+            );
         }
     }
 
@@ -450,41 +681,81 @@ impl KioskApp {
         }
     }
 
-    fn machine_selected(&mut self, slot: &SlotId) {
+    fn machine_selected(&mut self, slot: &SlotId, mdb_request: Option<MdbVendRequest>) {
         self.record_customer_activity();
         match self.engine.machine_selected(slot) {
-            Ok(outcome) => {
-                self.persist();
-                match outcome {
-                    SelectionOutcome::LightningPaymentRequired {
-                        transaction_id,
-                        selection,
-                        price_cents,
-                    } => {
-                        self.notice = None;
-                        self.page = Page::Lightning {
-                            transaction_id,
-                            selection,
-                            price_cents,
-                            started: self.now,
-                        };
+            Ok(SelectionOutcome::LightningPaymentRequired {
+                transaction_id,
+                selection,
+                price_cents,
+            }) => {
+                if !self.persist() {
+                    let _ = self.engine.vend_cancelled(transaction_id);
+                    self.persist();
+                    if let Some(request) = mdb_request {
+                        self.deny_mdb(request.vend_id);
                     }
-                    SelectionOutcome::VendApproved {
+                    self.page = Page::Ready;
+                    return;
+                }
+                if let Some(request) = mdb_request {
+                    self.active_mdb_vend = Some(ActiveMdbVend {
+                        vend_id: request.vend_id,
                         transaction_id,
-                        selection,
-                        payment,
-                    } => {
-                        self.notice = None;
-                        self.page = Page::Dispensing {
-                            transaction_id,
-                            selection,
-                            payment,
-                        };
+                        approval_sent: false,
+                    });
+                }
+                self.notice = None;
+                self.page = Page::Lightning {
+                    transaction_id,
+                    selection,
+                    price_cents,
+                    started: self.now,
+                };
+            }
+            Ok(SelectionOutcome::VendApproved {
+                transaction_id,
+                selection,
+                payment,
+            }) => {
+                if !self.persist() {
+                    let _ = self.engine.vend_cancelled(transaction_id);
+                    self.persist();
+                    if let Some(request) = mdb_request {
+                        self.deny_mdb(request.vend_id);
                     }
-                    SelectionOutcome::Denied(message) => self.notice = Some(message),
+                    self.page = Self::destination_page_for(&payment);
+                    return;
+                }
+                if let Some(request) = mdb_request {
+                    self.active_mdb_vend = Some(ActiveMdbVend {
+                        vend_id: request.vend_id,
+                        transaction_id,
+                        approval_sent: false,
+                    });
+                }
+                self.notice = None;
+                self.page = Page::Dispensing {
+                    transaction_id,
+                    selection,
+                    payment: payment.clone(),
+                };
+                if mdb_request.is_some() {
+                    self.approve_active_mdb_vend(&payment);
                 }
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Ok(SelectionOutcome::Denied(message)) => {
+                if let Some(request) = mdb_request {
+                    self.deny_mdb(request.vend_id);
+                }
+                self.notice = Some(message);
+            }
+            Err(error) => {
+                if let Some(request) = mdb_request {
+                    self.deny_mdb(request.vend_id);
+                }
+                self.notice = Some(error.to_string());
+            }
         }
     }
 
@@ -495,13 +766,24 @@ impl KioskApp {
                 selection,
                 payment,
             }) => {
-                self.persist();
+                if !self.persist() {
+                    let _ = self.engine.vend_cancelled(transaction_id);
+                    self.persist();
+                    if let Some(active) = self.active_mdb_vend.take() {
+                        self.deny_mdb(active.vend_id);
+                    }
+                    self.page = Page::Ready;
+                    return;
+                }
                 self.page = Page::Dispensing {
                     transaction_id,
                     selection,
-                    payment,
+                    payment: payment.clone(),
                 };
                 self.notice = None;
+                if self.is_hardware() {
+                    self.approve_active_mdb_vend(&payment);
+                }
             }
             Ok(_) => self.notice = Some("Unexpected Lightning transition.".to_owned()),
             Err(error) => self.notice = Some(error.to_string()),
@@ -509,17 +791,38 @@ impl KioskApp {
     }
 
     fn lightning_cancelled(&mut self, id: TransactionId) {
+        self.cancel_lightning_with_notice(id, "Lightning payment cancelled.");
+    }
+
+    fn cancel_lightning_with_notice(&mut self, id: TransactionId, notice: &str) {
         match self.engine.cancel_lightning(id) {
             Ok(()) => {
                 self.persist();
+                if let Some(active) = self
+                    .active_mdb_vend
+                    .filter(|active| active.transaction_id == id)
+                {
+                    self.active_mdb_vend = None;
+                    self.deny_mdb(active.vend_id);
+                }
                 self.page = Page::Ready;
-                self.notice = Some("Lightning payment cancelled.".to_owned());
+                self.notice = Some(notice.to_owned());
             }
             Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
     fn simulated_vend(&mut self, id: TransactionId, result: SimulatedVendResult) {
+        self.complete_vend(id, result, None);
+    }
+
+    fn complete_vend(
+        &mut self,
+        id: TransactionId,
+        result: SimulatedVendResult,
+        body_override: Option<&str>,
+    ) {
+        let state_before_result = self.engine.clone();
         let payment = self
             .engine
             .state()
@@ -534,7 +837,15 @@ impl KioskApp {
         };
         match outcome {
             Ok(()) => {
-                self.persist();
+                let persistence_failed = !self.persist();
+                let result = if persistence_failed {
+                    self.engine = state_before_result;
+                    let _ = self.engine.vend_uncertain(id);
+                    self.persist();
+                    SimulatedVendResult::Uncertain
+                } else {
+                    result
+                };
                 self.record_customer_activity();
                 let destination = match payment {
                     Some(PaymentKind::Promo { .. }) => Destination::Promo,
@@ -543,7 +854,7 @@ impl KioskApp {
                     }
                     _ => Destination::Ready,
                 };
-                let (title, body) = match result {
+                let (title, default_body) = match result {
                     SimulatedVendResult::Success => (
                         "Enjoy!",
                         "The vending machine reported a successful dispense.",
@@ -559,11 +870,104 @@ impl KioskApp {
                 };
                 self.page = Page::Result {
                     title: title.to_owned(),
-                    body: body.to_owned(),
+                    body: if persistence_failed {
+                        "The machine reported a result, but the kiosk could not save it. An administrator must reconcile this transaction.".to_owned()
+                    } else {
+                        body_override.unwrap_or(default_body).to_owned()
+                    },
                     destination,
                 };
             }
             Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    fn finish_mdb_vend(&mut self, vend_id: VendId, result: SimulatedVendResult, body: &str) {
+        let Some(active) = self
+            .active_mdb_vend
+            .filter(|active| active.vend_id == vend_id)
+        else {
+            return;
+        };
+        self.active_mdb_vend = None;
+        self.complete_vend(active.transaction_id, result, Some(body));
+    }
+
+    fn cancel_mdb_transaction(&mut self, vend_id: VendId, notice: &str) {
+        let Some(active) = self
+            .active_mdb_vend
+            .filter(|active| active.vend_id == vend_id)
+        else {
+            return;
+        };
+        self.active_mdb_vend = None;
+        let payment = self
+            .engine
+            .state()
+            .transactions()
+            .iter()
+            .find(|transaction| transaction.id() == active.transaction_id)
+            .map(|transaction| transaction.payment().clone());
+        match self.engine.vend_cancelled(active.transaction_id) {
+            Ok(()) => {
+                self.persist();
+                self.page = payment
+                    .as_ref()
+                    .map_or(Page::Ready, Self::destination_page_for);
+                self.notice = Some(notice.to_owned());
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    fn approve_active_mdb_vend(&mut self, payment: &PaymentKind) {
+        let Some(active) = self.active_mdb_vend else {
+            self.notice = Some("The MDB selection is no longer active.".to_owned());
+            return;
+        };
+        let amount = match approval_amount(payment) {
+            Ok(amount) => amount,
+            Err(error) => {
+                self.deny_mdb(active.vend_id);
+                self.cancel_mdb_transaction(active.vend_id, &error);
+                return;
+            }
+        };
+        let result = match &self.backend {
+            Backend::Hardware(controller) => controller.approve(active.vend_id, amount),
+            Backend::Simulator => return,
+        };
+        match result {
+            Ok(()) => {
+                if let Some(active) = self.active_mdb_vend.as_mut() {
+                    active.approval_sent = true;
+                }
+            }
+            Err(error) => {
+                self.machine_status = MachineStatus::Unavailable(error.to_string());
+                self.cancel_mdb_transaction(
+                    active.vend_id,
+                    "The MDB controller stopped before vend approval.",
+                );
+            }
+        }
+    }
+
+    fn deny_mdb(&mut self, vend_id: VendId) {
+        let result = match &self.backend {
+            Backend::Hardware(controller) => controller.deny(vend_id),
+            Backend::Simulator => return,
+        };
+        if let Err(error) = result {
+            self.machine_status = MachineStatus::Unavailable(error.to_string());
+        }
+    }
+
+    const fn destination_page_for(payment: &PaymentKind) -> Page {
+        match payment {
+            PaymentKind::Promo { .. } => Page::Promo,
+            PaymentKind::FreeVend | PaymentKind::MaintenanceTest => Page::Admin,
+            PaymentKind::Lightning { .. } => Page::Ready,
         }
     }
 
@@ -583,9 +987,13 @@ impl KioskApp {
         }
     }
 
-    fn persist(&mut self) {
-        if let Err(error) = self.store.save(self.engine.state()) {
-            self.notice = Some(format!("Could not save kiosk state: {error}"));
+    fn persist(&mut self) -> bool {
+        match self.store.save(self.engine.state()) {
+            Ok(()) => true,
+            Err(error) => {
+                self.notice = Some(format!("Could not save kiosk state: {error}"));
+                false
+            }
         }
     }
 
@@ -594,28 +1002,35 @@ impl KioskApp {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        let page = match &self.page {
-            Page::Ready => self.view_ready(),
-            Page::PromoEntry => self.view_promo_entry(),
-            Page::Promo => self.view_promo(),
-            Page::Lightning {
-                transaction_id,
-                selection,
-                price_cents,
-                started,
-            } => self.view_lightning(*transaction_id, selection, *price_cents, *started),
-            Page::Dispensing {
-                transaction_id,
-                selection,
-                payment,
-            } => Self::view_dispensing(*transaction_id, selection, payment),
-            Page::Result {
-                title,
-                body,
-                destination,
-            } => Self::view_result(title, body, *destination),
-            Page::AdminPin => self.view_admin_pin(),
-            Page::Admin => self.view_admin(),
+        let machine_unavailable = self.is_hardware()
+            && !matches!(self.machine_status, MachineStatus::Ready)
+            && !matches!(self.page, Page::AdminPin | Page::Admin);
+        let page = if machine_unavailable {
+            self.view_machine_unavailable()
+        } else {
+            match &self.page {
+                Page::Ready => self.view_ready(),
+                Page::PromoEntry => self.view_promo_entry(),
+                Page::Promo => self.view_promo(),
+                Page::Lightning {
+                    transaction_id,
+                    selection,
+                    price_cents,
+                    started,
+                } => self.view_lightning(*transaction_id, selection, *price_cents, *started),
+                Page::Dispensing {
+                    transaction_id,
+                    selection,
+                    payment,
+                } => self.view_dispensing(*transaction_id, selection, payment),
+                Page::Result {
+                    title,
+                    body,
+                    destination,
+                } => Self::view_result(title, body, *destination),
+                Page::AdminPin => self.view_admin_pin(),
+                Page::Admin => self.view_admin(),
+            }
         };
         container(page)
             .width(Length::Fill)
@@ -656,7 +1071,7 @@ impl KioskApp {
             text("Paying with Lightning?").size(20),
             text("Enter a Lightning item on the vending machine keypad."),
             scrollable(self.catalog_grid()).height(Length::Fill),
-            self.simulator_keypad()
+            self.machine_controls()
         ]
         .spacing(14);
         content.into()
@@ -759,7 +1174,7 @@ impl KioskApp {
             self.notice_view(),
             text("Enter any eligible selection on the vending machine keypad."),
             scrollable(entitlements).height(Length::Fill),
-            self.simulator_keypad()
+            self.machine_controls()
         ]
         .spacing(12)
         .into()
@@ -796,11 +1211,15 @@ impl KioskApp {
             .center(Length::Fill)
             .style(container::rounded_box),
             text(format!("{remaining} seconds remaining")).size(18),
-            button("Vend — simulate accepted hold invoice")
-                .padding(16)
-                .width(Length::Fill)
-                .style(button::success)
-                .on_press(Message::LightningAccepted(transaction_id)),
+            button(if self.is_hardware() {
+                "Vend"
+            } else {
+                "Vend — simulate accepted hold invoice"
+            })
+            .padding(16)
+            .width(Length::Fill)
+            .style(button::success)
+            .on_press(Message::LightningAccepted(transaction_id)),
             button("Cancel")
                 .padding(14)
                 .width(Length::Fill)
@@ -813,19 +1232,18 @@ impl KioskApp {
     }
 
     fn view_dispensing(
+        &self,
         transaction_id: TransactionId,
         selection: &MachineSelection,
         payment: &PaymentKind,
-    ) -> Element<'static, Message> {
-        column![
-            text("Dispensing…").size(38),
-            text(selection.product_name().to_owned()).size(26),
-            text(format!(
-                "Selection {} · {}",
-                selection.slot(),
-                payment.name()
-            ))
-            .size(18),
+    ) -> Element<'_, Message> {
+        let result_controls: Element<'_, Message> = if self.is_hardware() {
+            container(text("Waiting for the vending machine to report the result…").size(18))
+                .padding(16)
+                .width(Length::Fill)
+                .style(container::rounded_box)
+                .into()
+        } else {
             container(
                 column![
                     text("Simulator result").size(18),
@@ -851,11 +1269,23 @@ impl KioskApp {
                             SimulatedVendResult::Uncertain
                         ))
                 ]
-                .spacing(10)
+                .spacing(10),
             )
             .padding(16)
             .width(Length::Fill)
             .style(container::rounded_box)
+            .into()
+        };
+        column![
+            text("Dispensing…").size(38),
+            text(selection.product_name().to_owned()).size(26),
+            text(format!(
+                "Selection {} · {}",
+                selection.slot(),
+                payment.name()
+            ))
+            .size(18),
+            result_controls
         ]
         .align_x(iced::Alignment::Center)
         .spacing(22)
@@ -929,7 +1359,7 @@ impl KioskApp {
             self.notice_view(),
             text(arm_status),
             row![arm_button, disarm].spacing(8),
-            self.simulator_keypad(),
+            self.machine_controls(),
             text("Inventory and slot health").size(22),
             slot_list,
             text("Recent transactions").size(22),
@@ -1126,6 +1556,62 @@ impl KioskApp {
         )
     }
 
+    fn view_machine_unavailable(&self) -> Element<'_, Message> {
+        let (title, detail) = match &self.machine_status {
+            MachineStatus::Connecting => (
+                "Connecting to vending machine…",
+                "Selections will be available as soon as the MDB session is ready.".to_owned(),
+            ),
+            MachineStatus::Unavailable(error) => (
+                "Vending machine unavailable",
+                format!("{error}\n\nThe kiosk will retry automatically."),
+            ),
+            MachineStatus::Ready | MachineStatus::Simulator => (
+                "Vending machine unavailable",
+                "Waiting for MDB hardware.".to_owned(),
+            ),
+        };
+        column![
+            text(title).size(34),
+            text(detail).size(18),
+            button("Administrator access")
+                .padding(14)
+                .style(button::secondary)
+                .on_press(Message::OpenAdmin)
+        ]
+        .align_x(iced::Alignment::Center)
+        .spacing(24)
+        .into()
+    }
+
+    fn machine_controls(&self) -> Element<'_, Message> {
+        match &self.machine_status {
+            MachineStatus::Simulator => self.simulator_keypad(),
+            MachineStatus::Connecting => container(text("Connecting to MDB machine…").size(15))
+                .padding(10)
+                .width(Length::Fill)
+                .style(container::warning)
+                .into(),
+            MachineStatus::Ready => {
+                container(text("MDB machine ready · enter a selection on its keypad").size(15))
+                    .padding(10)
+                    .width(Length::Fill)
+                    .style(container::rounded_box)
+                    .into()
+            }
+            MachineStatus::Unavailable(error) => container(
+                text(format!(
+                    "MDB unavailable · {error} · retrying automatically"
+                ))
+                .size(15),
+            )
+            .padding(10)
+            .width(Length::Fill)
+            .style(container::danger)
+            .into(),
+        }
+    }
+
     fn simulator_keypad(&self) -> Element<'_, Message> {
         let mut keys = Column::new().spacing(6);
         let slots = self.engine.catalog().slots().collect::<Vec<_>>();
@@ -1213,6 +1699,15 @@ fn dollars(cents: u32) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }
 
+fn approval_amount(payment: &PaymentKind) -> Result<Level1Amount, String> {
+    let raw = match payment {
+        PaymentKind::Lightning { price_cents } => u16::try_from(price_cents / 10)
+            .map_err(|_| format!("configured Lightning price {price_cents} cents exceeds MDB"))?,
+        PaymentKind::Promo { .. } | PaymentKind::FreeVend | PaymentKind::MaintenanceTest => 0,
+    };
+    Level1Amount::new(raw).map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,5 +1716,27 @@ mod tests {
     fn formats_catalog_prices() {
         assert_eq!(dollars(250), "$2.50");
         assert_eq!(dollars(400), "$4.00");
+    }
+
+    #[test]
+    fn converts_kiosk_policy_to_mdb_approval_amounts() {
+        assert_eq!(
+            approval_amount(&PaymentKind::Lightning { price_cents: 250 })
+                .unwrap()
+                .raw(),
+            25
+        );
+        assert_eq!(approval_amount(&PaymentKind::FreeVend).unwrap().raw(), 0);
+    }
+
+    #[test]
+    fn hardware_mode_requires_an_explicit_port() {
+        let simulator = Args::try_parse_from(["lv-kiosk"]).unwrap();
+        assert_eq!(simulator.port, None);
+        assert_eq!(simulator.baud, 9600);
+
+        let hardware = Args::try_parse_from(["lv-kiosk", "--port", "/dev/ttyUSB0"]).unwrap();
+        assert_eq!(hardware.port, Some(PathBuf::from("/dev/ttyUSB0")));
+        assert_eq!(hardware.baud, 9600);
     }
 }

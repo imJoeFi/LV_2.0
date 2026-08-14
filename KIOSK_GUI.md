@@ -1,9 +1,9 @@
 # LightningVEND kiosk GUI
 
-The `lv-kiosk` binary is the first simulator-backed shell for the 480×800
-portrait touchscreen. It deliberately does not open the MDB serial port yet.
-Its job is to make the customer, inventory, promo, maintenance, and persistence
-state machines testable before they can authorize physical vends.
+The `lv-kiosk` binary is the 480×800 portrait touchscreen application. It can
+run with either its built-in simulator or a live MDB machine. Supplying
+`--port` explicitly enables hardware mode; omitting it is always safe and keeps
+all vending simulated.
 
 ## Run the simulator
 
@@ -28,7 +28,46 @@ window. Development mode is a fixed logical 480×800 window, matching an
 800×480 panel rotated to portrait.
 
 The panel labeled **SIMULATED VENDING KEYPAD** stands in for selections that the
-VMC will eventually deliver through `MdbSession` events.
+VMC delivers through `MdbSession` events in hardware mode.
+
+## Run with the MDB machine
+
+Only one process may own the PC2MDB serial port. Stop `mdb-flow-test` before
+starting the GUI, then run:
+
+```sh
+cargo run --release --bin lv-kiosk -- \
+  --port /dev/ttyUSB0 \
+  --fullscreen
+```
+
+The baud rate defaults to 9600 and can be changed with `--baud`. For an empty
+development database, add `--seed-demo` once to import the sample promo codes
+and stock each configured slot with three items. That flag replaces the promo
+codes and resets demo inventory every time it is used, so do not leave it in a
+production startup command.
+
+Hardware mode:
+
+- opens an MDB session with unknown funds and automatically re-arms after every
+  completed or cancelled session;
+- maps the AP113 item bytes to catalog slots such as `A1` and `B2`;
+- ignores the price requested by the VMC;
+- approves Lightning vends at the price in `config/kiosk.toml`;
+- approves promo, free, and maintenance vends at zero MDB monetary units;
+- saves the transaction or promo reservation before sending `VEND APPROVED`;
+- denies unknown, unavailable, out-of-stock, and unauthorized selections;
+- hides all simulated machine controls;
+- marks ambiguous disconnects after approval as uncertain for administrator
+  reconciliation; and
+- fails closed, displays **Vending machine unavailable**, and retries the serial
+  connection automatically.
+
+The terminal running the GUI prints the raw MDB TX/RX trace for hardware
+debugging. The actor uses a 46-second application response window to support the
+45-second temporary Lightning screen. The adapter's stored MDB configuration
+must advertise a compatible response time; changing the application setting
+does not reprogram the adapter.
 
 ### Promo exercise
 
@@ -92,8 +131,8 @@ administrator reconciles it.
 
 ## Application and MDB sessions
 
-The eventual controller will continuously re-arm short-lived MDB sessions while
-the GUI maintains a longer customer session:
+The controller continuously re-arms short-lived MDB sessions while the GUI
+maintains a longer customer session:
 
 ```text
 customer promo session
@@ -121,24 +160,24 @@ On restart:
 - its slot becomes `NeedsAttention`;
 - a promo reservation remains held for administrator review.
 
-## Integration boundary
+## MDB integration boundary
 
-The simulator currently calls `KioskEngine::machine_selected` directly. The MDB
-integration should replace only that source of machine events and the three
-simulated result buttons:
+A dedicated Tokio thread exclusively owns `MdbDevice`, each `MdbSession`, and
+the current single-use `PendingVend`. Iced receives typed events and can only
+send an approve or deny decision for the matching vend ID. Machine events are
+prioritized over queued touchscreen decisions so that a buffered VMC
+cancellation is handled before a nearly simultaneous approval.
 
-- `SessionEvent::VendRequested` → map AP113 item bytes to `SlotId`, then call
-  `machine_selected`;
-- an approved domain outcome → persist first, then call `PendingVend::approve_for`;
-- `VendSucceeded`, `VendFailed`, cancellation, or uncertain disconnect → the
-  corresponding engine transition.
+`SessionEvent::VendRequested` is mapped to a `SlotId` and passed through the same
+`KioskEngine::machine_selected` path used by the simulator. Successful and
+failed vend reports then update inventory, entitlements, slot health, and
+transaction history through the existing durable domain transitions.
 
 Before real money is enabled, the outstanding ACK/retransmission and adapter
 deadline issues in `MDB_ACTOR_FOLLOW_UPS.md` still need resolving.
 
 ## Not implemented yet
 
-- live MDB controller integration;
 - actual Lightning hold invoices and QR generation;
 - production secret handling for the admin PIN;
 - automatic Raspberry Pi startup and display rotation configuration;

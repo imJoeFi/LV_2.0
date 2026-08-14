@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
+const MAX_MDB_PRICE_CENTS: u32 = 0xfffe * 10;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProductId(String);
@@ -189,7 +191,9 @@ impl Catalog {
                     return Err(CatalogError::PromoPrice(id));
                 }
                 (PaymentConfig::Lightning, Some(price_cents))
-                    if price_cents > 0 && price_cents.is_multiple_of(10) =>
+                    if price_cents > 0
+                        && price_cents <= MAX_MDB_PRICE_CENTS
+                        && price_cents.is_multiple_of(10) =>
                 {
                     PaymentPolicy::Lightning { price_cents }
                 }
@@ -307,7 +311,9 @@ pub enum CatalogError {
     PromoPrice(SlotId),
     #[error("Lightning slot {0} must define price_cents")]
     MissingLightningPrice(SlotId),
-    #[error("Lightning slot {slot} has invalid price {price_cents}; use a positive multiple of 10 cents")]
+    #[error(
+        "Lightning slot {slot} has invalid price {price_cents}; use a positive multiple of 10 cents no greater than 655340"
+    )]
     InvalidLightningPrice { slot: SlotId, price_cents: u32 },
 }
 
@@ -355,6 +361,12 @@ mod tests {
     #[test]
     fn rejects_lightning_prices_that_mdb_cannot_represent() {
         let source = CATALOG.replace("price_cents = 250", "price_cents = 255");
+        assert!(matches!(
+            Catalog::parse(&source, Path::new(".")),
+            Err(CatalogError::InvalidLightningPrice { .. })
+        ));
+
+        let source = CATALOG.replace("price_cents = 250", "price_cents = 655350");
         assert!(matches!(
             Catalog::parse(&source, Path::new(".")),
             Err(CatalogError::InvalidLightningPrice { .. })

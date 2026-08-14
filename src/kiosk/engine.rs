@@ -626,6 +626,25 @@ impl KioskEngine {
         Ok(())
     }
 
+    /// Records that the VMC cancelled a selection before a successful vend.
+    ///
+    /// Unlike a vend failure, cancellation does not mark the slot as needing
+    /// attention. Any promo entitlement reserved before approval is released.
+    pub fn vend_cancelled(&mut self, id: TransactionId) -> Result<(), KioskError> {
+        if self.active_transaction != Some(id) {
+            return Err(KioskError::TransactionNotActive(id));
+        }
+        let transaction = self.state.transaction(id)?.clone();
+        match transaction.status {
+            TransactionStatus::AwaitingPayment => {}
+            TransactionStatus::AwaitingVend => self.resolve_promo(&transaction, false)?,
+            _ => return Err(KioskError::InvalidTransactionState(id)),
+        }
+        self.state.transaction_mut(id)?.status = TransactionStatus::Cancelled;
+        self.active_transaction = None;
+        Ok(())
+    }
+
     pub fn vend_succeeded(&mut self, id: TransactionId) -> Result<(), KioskError> {
         self.finish_vend(id, VendResult::Succeeded)
     }
@@ -938,6 +957,34 @@ mod tests {
                 .unwrap()
                 .remaining(),
             2
+        );
+    }
+
+    #[test]
+    fn vmc_cancellation_releases_promo_without_faulting_the_slot() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("A1").unwrap();
+        engine
+            .authenticate_code(PromoCode::parse("123456").unwrap())
+            .unwrap();
+        let transaction = transaction_id(engine.machine_selected(&slot).unwrap());
+
+        engine.vend_cancelled(transaction).unwrap();
+
+        assert_eq!(engine.state().health(&slot), SlotHealth::Ready);
+        assert_eq!(engine.state().inventory(&slot), 2);
+        assert_eq!(
+            engine
+                .active_account()
+                .unwrap()
+                .entitlement(&ProductId::parse("water").unwrap())
+                .unwrap()
+                .remaining(),
+            2
+        );
+        assert_eq!(
+            engine.state().transactions().last().unwrap().status(),
+            TransactionStatus::Cancelled
         );
     }
 
