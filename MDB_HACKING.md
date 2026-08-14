@@ -251,6 +251,11 @@ accepting selections. It survives the controlling script exiting. **Always send
 top of every round, and it is the difference between a machine that recovers and
 one that looks bricked.
 
+Do not queue the next `BEGIN SESSION` until the VMC has ACKed `END SESSION`.
+An AP 113 capture on 2026-08-14 showed that sending them one millisecond apart
+made the VMC answer with a one-byte `10` RESET. The Rust actor holds session
+ownership through that ACK so the next round cannot race teardown.
+
 ### Every branch, and what the machine does
 
 | Branch | Machine's response | Outcome |

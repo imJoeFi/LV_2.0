@@ -13,9 +13,12 @@ was not connected during this review.
 ### 1. Correlate every response with the adapter/VMC acknowledgement
 
 `Link::send` currently succeeds after writing and flushing the serial frame.
-The actor then advances its state immediately, while incoming `ACK`, `NAK`, and
-`RET` messages are not correlated with the command that produced them. `NAK`
-and `RET` are currently only traced.
+Most operations then advance their state immediately, while incoming `ACK`,
+`NAK`, and `RET` messages are not correlated with the command that produced
+them. `NAK` and `RET` are currently only traced. Session teardown is the one
+implemented exception: after `SESSION COMPLETE`, the actor retains the active
+session until `END SESSION` is ACKed so a new `BEGIN SESSION` cannot overwrite
+the adapter's pending response.
 
 This is especially dangerous for `VEND APPROVED`: a later `RESET` can be
 reported as `VendSucceeded::AssumedAfterReset` even if the approval was never
@@ -106,9 +109,11 @@ qualified so the VMC is not told refund handling is complete too early.
 ### Session-complete response on real hardware
 
 The actor now uses the specification's `END SESSION` response (`07 07`) after
-`SESSION COMPLETE`. The physically proven local transcript records the older
-harness sending `06 06`. Keep the spec-correct implementation, but qualify the
-new response against the AP 113 before replacing the proven harness in service.
+`SESSION COMPLETE`. An AP 113 capture confirmed that immediately queueing the
+next `BEGIN SESSION` can provoke a one-byte `10` RESET before teardown settles;
+the actor now waits for the `END SESSION` ACK before returning session
+ownership. The physically proven older harness sent `06 06`, so repeated-round
+qualification of the spec-correct response is still required on the AP 113.
 
 ## Validation required before closing this document
 

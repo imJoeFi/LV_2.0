@@ -326,6 +326,9 @@ impl Error for ProtocolError {}
 pub fn parse_adapter_message(bytes: &[u8]) -> Result<AdapterMessage, ProtocolError> {
     match bytes {
         [0x00] => return Ok(AdapterMessage::Ack),
+        // The WAFER PC2MDB forwards RESET as the single command byte rather
+        // than the usual payload-plus-checksum representation.
+        [0x10] => return Ok(AdapterMessage::Vmc(VmcEvent::Reset)),
         [0xff] => return Ok(AdapterMessage::Nak),
         [0xaa] => return Ok(AdapterMessage::Retransmit),
         _ => {}
@@ -586,6 +589,18 @@ mod tests {
         assert_eq!(
             parse_adapter_message(&[0x13, 0x04, 0x00, 0x17]),
             Err(ProtocolError::InvalidLength)
+        );
+    }
+
+    #[test]
+    fn accepts_the_wafer_adapters_single_byte_reset() {
+        assert_eq!(
+            parse_adapter_message(&[0x10]),
+            Ok(AdapterMessage::Vmc(VmcEvent::Reset))
+        );
+        assert_eq!(
+            parse_adapter_message(&[0x10, 0x10]),
+            Ok(AdapterMessage::Vmc(VmcEvent::Reset))
         );
     }
 }

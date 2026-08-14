@@ -716,12 +716,14 @@ struct VendRecord {
     approved_amount: Option<Level1Amount>,
 }
 
+#[derive(Clone, Copy)]
 enum SessionPhase {
     Idle,
     VendPending { vend: VendRecord, deadline: Instant },
     DenyingForEnd(VendRecord),
     AwaitingVendResult(VendRecord),
     AwaitingSessionComplete,
+    AwaitingEndSessionAck(SessionEndReason),
     AwaitingReset(Option<VendRecord>),
 }
 
@@ -1227,7 +1229,8 @@ where
             SessionPhase::DenyingForEnd(_) => 2,
             SessionPhase::AwaitingVendResult(_) => 3,
             SessionPhase::AwaitingSessionComplete => 4,
-            SessionPhase::AwaitingReset(_) => 5,
+            SessionPhase::AwaitingEndSessionAck(_) => 5,
+            SessionPhase::AwaitingReset(_) => 6,
         });
         if let Some(session) = &mut self.active {
             session.end_requested = true;
@@ -1258,7 +1261,7 @@ where
                     );
                 }
             }
-            Some(2..=5) | None => {}
+            Some(2..=6) | None => {}
             Some(_) => unreachable!(),
         }
         Ok(())
@@ -1267,15 +1270,18 @@ where
     async fn handle_adapter_message(&mut self, message: AdapterMessage) -> Result<(), MdbError> {
         match message {
             AdapterMessage::Ack => {
-                let denying_for_end = self
-                    .active
-                    .as_ref()
-                    .is_some_and(|session| matches!(session.phase, SessionPhase::DenyingForEnd(_)));
-                if denying_for_end {
-                    self.link.send(ReaderCommand::SessionCancel).await?;
-                    if let Some(session) = &mut self.active {
-                        session.phase = SessionPhase::AwaitingSessionComplete;
+                let phase = self.active.as_ref().map(|session| session.phase);
+                match phase {
+                    Some(SessionPhase::DenyingForEnd(_)) => {
+                        self.link.send(ReaderCommand::SessionCancel).await?;
+                        if let Some(session) = &mut self.active {
+                            session.phase = SessionPhase::AwaitingSessionComplete;
+                        }
                     }
+                    Some(SessionPhase::AwaitingEndSessionAck(reason)) => {
+                        self.complete_active(reason);
+                    }
+                    _ => {}
                 }
             }
             AdapterMessage::Nak | AdapterMessage::Retransmit => {
@@ -1428,6 +1434,7 @@ where
                 SessionPhase::Idle
                     | SessionPhase::DenyingForEnd(_)
                     | SessionPhase::AwaitingSessionComplete
+                    | SessionPhase::AwaitingEndSessionAck(_)
             )
         });
         if !valid {
@@ -1442,7 +1449,9 @@ where
             .map_or(SessionEndReason::Completed, |session| {
                 session.summary.reason
             });
-        self.complete_active(reason);
+        if let Some(session) = &mut self.active {
+            session.phase = SessionPhase::AwaitingEndSessionAck(reason);
+        }
         Ok(())
     }
 
@@ -1782,6 +1791,7 @@ mod tests {
         let _ = read_reader(&mut adapter, 2).await;
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         let _ = read_reader(&mut adapter, 2).await;
+        send_adapter_ack(&mut adapter).await;
         let _ = session.next_event().await.unwrap();
         let _ = session.finish().await.unwrap();
     }
@@ -1938,12 +1948,13 @@ mod tests {
         let _ = read_reader(&mut adapter, 2).await;
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         let _ = read_reader(&mut adapter, 2).await;
+        send_adapter_ack(&mut adapter).await;
         let _ = session.next_event().await.unwrap();
         let _ = session.finish().await.unwrap();
     }
 
     #[tokio::test]
-    async fn successful_vend_ends_with_end_session() {
+    async fn successful_vend_waits_for_end_session_ack_before_rearming() {
         let (device, mut adapter) = fake_device(Duration::from_secs(1));
         let mut session = device.begin_session(known_funds(1345)).await.unwrap();
         assert_eq!(read_reader(&mut adapter, 4).await, [0x03, 0x05, 0x41, 0x49]);
@@ -1966,6 +1977,8 @@ mod tests {
 
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         assert_eq!(read_reader(&mut adapter, 2).await, [0x07, 0x07]);
+        assert!(session.try_event().unwrap().is_none());
+        send_adapter_ack(&mut adapter).await;
         assert!(matches!(
             session.next_event().await.unwrap(),
             SessionEvent::Ended {
@@ -1974,6 +1987,21 @@ mod tests {
         ));
         let ended = session.finish().await.unwrap();
         assert_eq!(ended.summary().successful_vends(), 1);
+
+        let mut second_session = ended
+            .into_device()
+            .begin_session(known_funds(1345))
+            .await
+            .unwrap();
+        assert_eq!(read_reader(&mut adapter, 4).await, [0x03, 0x05, 0x41, 0x49]);
+        adapter.write_all(b"\x0210\x03").await.unwrap();
+        assert!(matches!(
+            second_session.next_event().await.unwrap(),
+            SessionEvent::Ended {
+                reason: SessionEndReason::Reset
+            }
+        ));
+        let _ = second_session.finish().await.unwrap();
     }
 
     #[tokio::test]
@@ -1995,6 +2023,7 @@ mod tests {
 
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         assert_eq!(read_reader(&mut adapter, 2).await, [0x07, 0x07]);
+        send_adapter_ack(&mut adapter).await;
         assert!(matches!(
             session.next_event().await.unwrap(),
             SessionEvent::Ended { .. }
@@ -2019,6 +2048,7 @@ mod tests {
         assert_eq!(read_reader(&mut adapter, 2).await, [0x04, 0x04]);
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         assert_eq!(read_reader(&mut adapter, 2).await, [0x07, 0x07]);
+        send_adapter_ack(&mut adapter).await;
         let ended = finish.await.unwrap().unwrap();
         assert_eq!(
             ended.summary().reason(),
@@ -2077,6 +2107,7 @@ mod tests {
 
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         let _ = read_reader(&mut adapter, 2).await;
+        send_adapter_ack(&mut adapter).await;
         let _ = session.next_event().await.unwrap();
         let _ = session.finish().await.unwrap();
     }
@@ -2102,6 +2133,7 @@ mod tests {
 
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         let _ = read_reader(&mut adapter, 2).await;
+        send_adapter_ack(&mut adapter).await;
         let _ = session.next_event().await.unwrap();
         let _ = session.finish().await.unwrap();
     }
@@ -2151,6 +2183,7 @@ mod tests {
         assert_eq!(read_reader(&mut adapter, 2).await, [0x04, 0x04]);
         send_vmc(&mut adapter, &[0x13, 0x04]).await;
         let _ = read_reader(&mut adapter, 2).await;
+        send_adapter_ack(&mut adapter).await;
         let _ = finish.await.unwrap().unwrap();
     }
 
