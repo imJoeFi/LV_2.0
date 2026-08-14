@@ -1,12 +1,13 @@
-use crate::link::Link;
-use crate::protocol::{Funds, Price, ReaderCommand, Selection, VmcEvent};
+use crate::device::{
+    MdbConfig, MdbDevice, MdbSession, PendingVend, SessionEndReason, SessionEvent, SessionFunds,
+};
+use crate::protocol::{ItemNumber, Level1Amount};
 use crate::terminal::{flush_input, read_key, timestamp, Cbreak, Console};
 use std::collections::BTreeSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread;
 use std::time::{Duration, Instant};
 
 const SETTLE_WATCH: Duration = Duration::from_secs(10);
@@ -15,73 +16,78 @@ pub struct HarnessConfig {
     port: PathBuf,
     baud: u32,
     payment_window: Duration,
-    funds: Funds,
+    funds: SessionFunds,
 }
 
 impl HarnessConfig {
     pub fn new(port: PathBuf, baud: u32, payment_window: Duration, funds: u16) -> Self {
+        let funds = Level1Amount::new(funds).map_or(SessionFunds::Unknown, SessionFunds::Known);
         Self {
             port,
             baud,
             payment_window,
-            funds: Funds::new(funds),
+            funds,
         }
     }
 }
 
 pub struct Harness {
     config: HarnessConfig,
-    link: Link,
+    device: Option<MdbDevice>,
     console: Console,
     interrupted: Arc<AtomicBool>,
 }
 
 impl Harness {
-    pub fn open(config: HarnessConfig, interrupted: Arc<AtomicBool>) -> io::Result<Self> {
+    pub async fn open(config: HarnessConfig, interrupted: Arc<AtomicBool>) -> io::Result<Self> {
         let console = Console::default();
-        let link = Link::open(&config.port, config.baud, console.clone())?;
-        thread::sleep(Duration::from_millis(500));
+        let trace_console = console.clone();
+        let mdb_config = MdbConfig::new(config.port.clone(), config.baud)
+            .with_application_response_time(config.payment_window + Duration::from_secs(1));
+        let device = MdbDevice::connect_with_trace(&mdb_config, move |message| {
+            trace_console.log(format!("{}  {message}", timestamp()));
+        })
+        .await?;
         Ok(Self {
             config,
-            link,
+            device: Some(device),
             console,
             interrupted,
         })
     }
 
-    pub fn clear_session(&mut self) -> io::Result<()> {
-        self.console.log("clearing any open session...");
-        self.link.send(ReaderCommand::EndSession)?;
-        thread::sleep(Duration::from_millis(1500));
-        self.link.stop();
-        self.console
-            .log("done -- if the display is still stuck, power-cycle the machine");
-        Ok(())
-    }
-
-    pub fn run(&mut self) -> io::Result<()> {
+    pub async fn run(&mut self) -> io::Result<()> {
         self.print_startup();
+        let mut device = Some(self.take_device()?);
         let mut round_number = 0_u64;
         let loop_result = loop {
             if self.is_interrupted() {
                 break Ok(());
             }
             round_number += 1;
-            match self.run_round(round_number) {
-                Ok(RoundOutcome::Continue) => {}
-                Ok(RoundOutcome::Interrupted) => break Ok(()),
+            let Some(current_device) = device.take() else {
+                break Err(io::Error::other("MDB device is unavailable"));
+            };
+            match self.run_round(current_device, round_number).await {
+                Ok((next_device, RoundOutcome::Continue)) => device = Some(next_device),
+                Ok((next_device, RoundOutcome::Interrupted)) => {
+                    device = Some(next_device);
+                    break Ok(());
+                }
                 Err(error) => break Err(error),
             }
         };
 
         self.console.set_countdown("");
-        self.console.log("\nstopping -- closing the session");
-        if let Err(error) = self.link.send(ReaderCommand::EndSession) {
-            self.console
-                .log(format!("{}  could not close session: {error}", timestamp()));
+        self.console.log("\nstopping");
+        if let Some(device) = device {
+            if let Err(error) = device.shutdown().await {
+                self.console.log(format!(
+                    "{}  could not stop MDB actor: {error}",
+                    timestamp()
+                ));
+            }
         }
-        thread::sleep(Duration::from_millis(500));
-        self.link.stop();
         loop_result
     }
 
@@ -93,22 +99,34 @@ impl Harness {
             self.config.payment_window.as_secs_f64()
         ));
         self.console.log(format!(
-            "funds    0x{:04X} ({})",
-            self.config.funds.raw(),
-            self.config.funds
+            "adapter  must advertise at least {:.0}s maximum response time",
+            (self.config.payment_window + Duration::from_secs(1)).as_secs_f64()
         ));
+        match self.config.funds {
+            SessionFunds::Known(funds) => self.console.log(format!(
+                "funds    0x{:04X} ({})",
+                funds.raw(),
+                format_money(funds)
+            )),
+            SessionFunds::Unknown => self.console.log("funds    0xFFFF (MDB unknown funds)"),
+            SessionFunds::MachineMaximum => self.console.log("funds    machine maximum"),
+        }
         self.console.log(format!(
             "scale    raw x 10 / 10^2 -- so raw 1345 = {}",
-            Price::new(1345)
+            format_money(Level1Amount::new(1345).expect("1345 is a valid MDB amount"))
         ));
         self.console
             .log("WARNING  answering \"y\" vends for real. B2 is your empty slot.");
         self.console.log("Ctrl+C to stop.");
     }
 
-    fn run_round(&mut self, round_number: u64) -> io::Result<RoundOutcome> {
+    async fn run_round(
+        &self,
+        device: MdbDevice,
+        round_number: u64,
+    ) -> io::Result<(MdbDevice, RoundOutcome)> {
         if self.is_interrupted() {
-            return Ok(RoundOutcome::Interrupted);
+            return Ok((device, RoundOutcome::Interrupted));
         }
         self.console.log("");
         self.console.log("=".repeat(68));
@@ -117,44 +135,47 @@ impl Harness {
         ));
         self.console.log("=".repeat(68));
 
-        self.link.drain_events()?;
-        self.link.send(ReaderCommand::EndSession)?;
-        thread::sleep(Duration::from_millis(500));
-        if self.is_interrupted() {
-            return Ok(RoundOutcome::Interrupted);
-        }
-        self.link.drain_events()?;
-        self.link
-            .send(ReaderCommand::BeginSession(self.config.funds))?;
-
-        let Some((price, selection)) = self.wait_for_selection()? else {
-            return Ok(RoundOutcome::Interrupted);
+        let session = device
+            .begin_session(self.config.funds)
+            .await
+            .map_err(io::Error::other)?;
+        let (mut session, vend) = self.wait_for_selection(session).await?;
+        let Some(vend) = vend else {
+            let ended = session.finish().await?;
+            return Ok((ended.into_device(), RoundOutcome::Interrupted));
         };
+        let price = vend.requested_price();
+        let item = vend.item_number();
         self.console.log(format!(
-            "{}  ==> SELECTION {selection}  price={} ({price})  raw item bytes \
-             {:02X} {:02X}",
+            "{}  ==> SELECTION {}  price={} ({})  raw item bytes {:02X} {:02X}",
             timestamp(),
+            format_ap113_item(item),
             price.raw(),
-            selection.row(),
-            selection.column()
+            format_money(price),
+            item.bytes()[0],
+            item.bytes()[1]
         ));
-        show_fake_qr(&self.console, selection, price);
+        show_fake_qr(&self.console, item, price);
 
         let payment_started = Instant::now();
-        let result = self.wait_for_payment()?;
+        let result = self.wait_for_payment(&mut session)?;
         let elapsed = payment_started.elapsed();
 
         match result {
-            PaymentResult::Interrupted => return Ok(RoundOutcome::Interrupted),
+            PaymentResult::Interrupted => {
+                let ended = session.finish().await?;
+                return Ok((ended.into_device(), RoundOutcome::Interrupted));
+            }
             PaymentResult::Cancelled => {
                 self.console.log(format!(
                     "{}  round ended by the machine after {:.1}s",
                     timestamp(),
                     elapsed.as_secs_f64()
                 ));
-                return Ok(RoundOutcome::Continue);
+                let ended = session.finish().await?;
+                return Ok((ended.into_device(), RoundOutcome::Continue));
             }
-            _ => {}
+            PaymentResult::Paid | PaymentResult::Declined | PaymentResult::Timeout => {}
         }
 
         let expectation = if result == PaymentResult::Paid {
@@ -163,7 +184,7 @@ impl Harness {
                 timestamp(),
                 elapsed.as_secs_f64()
             ));
-            self.link.send(ReaderCommand::Approve(price))?;
+            vend.approve().await.map_err(io::Error::other)?;
             "expect VEND SUCCESS 13 02, or VEND FAILURE 13 03 if the slot is empty"
         } else {
             let reason = if result == PaymentResult::Declined {
@@ -171,39 +192,33 @@ impl Harness {
             } else {
                 format!("timed out at {:.0}s", elapsed.as_secs_f64())
             };
-            self.console.log(format!(
-                "{}  payment {reason} -- denying so the machine resets",
-                timestamp()
-            ));
-            self.link.send(ReaderCommand::Deny)?;
-            "expect the machine to reset and release the selection"
+            self.console
+                .log(format!("{}  payment {reason} -- denying", timestamp()));
+            vend.deny().await.map_err(io::Error::other)?;
+            "expect SESSION COMPLETE and no vend"
         };
 
         self.console.log(format!(
             "    watching {}s -- {expectation}",
             SETTLE_WATCH.as_secs()
         ));
-        let seen = self.watch(SETTLE_WATCH)?;
+        let seen = self.watch(&mut session, SETTLE_WATCH).await?;
         self.report_result(result, &seen);
 
-        if !seen.session_complete {
-            self.console.log(format!(
-                "{}  no SESSION COMPLETE -- closing the session ourselves",
-                timestamp()
-            ));
-            self.link.send(ReaderCommand::EndSession)?;
-            thread::sleep(Duration::from_secs(1));
-        }
-        Ok(RoundOutcome::Continue)
+        let ended = session.finish().await?;
+        Ok((ended.into_device(), RoundOutcome::Continue))
     }
 
-    fn wait_for_selection(&mut self) -> io::Result<Option<(Price, Selection)>> {
+    async fn wait_for_selection(
+        &self,
+        mut session: MdbSession,
+    ) -> io::Result<(MdbSession, Option<PendingVend>)> {
         let mut waited = Duration::ZERO;
         loop {
             if self.is_interrupted() {
-                return Ok(None);
+                return Ok((session, None));
             }
-            let Some(event) = self.link.receive_event(Duration::from_secs(1))? else {
+            let Some(event) = session.receive_event(Duration::from_secs(1)).await? else {
                 waited += Duration::from_secs(1);
                 if waited.as_secs().is_multiple_of(15) {
                     self.console.log(format!(
@@ -215,25 +230,27 @@ impl Harness {
                 continue;
             };
             match event {
-                VmcEvent::VendRequest { price, selection } => {
-                    return Ok(Some((price, selection)));
-                }
-                VmcEvent::SessionComplete => {
+                SessionEvent::VendRequested(vend) => return Ok((session, Some(vend))),
+                SessionEvent::Ended { reason } => {
                     self.console.log(format!(
-                        "{}  machine closed the session before a selection -- re-arming",
+                        "{}  machine ended the session before a selection ({reason:?}) -- re-arming",
                         timestamp()
                     ));
-                    self.link.send(ReaderCommand::AcknowledgeSessionComplete)?;
-                    thread::sleep(Duration::from_millis(500));
-                    self.link
-                        .send(ReaderCommand::BeginSession(self.config.funds))?;
+                    let device = session.finish().await?.into_device();
+                    session = device
+                        .begin_session(self.config.funds)
+                        .await
+                        .map_err(io::Error::other)?;
                 }
-                _ => {}
+                SessionEvent::VendCancelled { .. }
+                | SessionEvent::VendDecisionExpired { .. }
+                | SessionEvent::VendSucceeded { .. }
+                | SessionEvent::VendFailed { .. } => {}
             }
         }
     }
 
-    fn wait_for_payment(&self) -> io::Result<PaymentResult> {
+    fn wait_for_payment(&self, session: &mut MdbSession) -> io::Result<PaymentResult> {
         let deadline = Instant::now() + self.config.payment_window;
         flush_input();
         self.console.log(
@@ -260,8 +277,14 @@ impl Harness {
             ));
 
             if matches!(
-                self.link.try_event()?,
-                Some(VmcEvent::VendCancel | VmcEvent::SessionComplete | VmcEvent::VendFailure)
+                session.try_event()?,
+                Some(
+                    SessionEvent::VendCancelled { .. }
+                        | SessionEvent::VendDecisionExpired { .. }
+                        | SessionEvent::Ended { .. }
+                        | SessionEvent::VendFailed { .. }
+                        | SessionEvent::VendSucceeded { .. }
+                )
             ) {
                 self.console.set_countdown("");
                 return Ok(PaymentResult::Cancelled);
@@ -288,16 +311,15 @@ impl Harness {
         }
     }
 
-    fn watch(&mut self, duration: Duration) -> io::Result<WatchResult> {
+    async fn watch(&self, session: &mut MdbSession, duration: Duration) -> io::Result<WatchResult> {
         let mut seen = WatchResult::default();
         let deadline = Instant::now() + duration;
         while Instant::now() < deadline && !self.is_interrupted() {
-            let Some(event) = self.link.receive_event(Duration::from_millis(200))? else {
+            let Some(event) = session.receive_event(Duration::from_millis(200)).await? else {
                 continue;
             };
-            seen.record(event);
-            if seen.session_complete {
-                self.link.send(ReaderCommand::AcknowledgeSessionComplete)?;
+            seen.record(&event);
+            if seen.session_ended {
                 break;
             }
         }
@@ -306,12 +328,12 @@ impl Harness {
 
     fn report_result(&self, payment: PaymentResult, seen: &WatchResult) {
         if seen.vend_success {
-            let selection = seen
-                .vended_selection
-                .map(|selection| format!(" {selection}"))
+            let item = seen
+                .vended_item
+                .map(|item| format!(" {}", format_ap113_item(item)))
                 .unwrap_or_default();
             self.console
-                .log(format!("{}  RESULT: vended{selection}", timestamp()));
+                .log(format!("{}  RESULT: vended{item}", timestamp()));
         } else if payment == PaymentResult::Paid {
             if seen.vend_failure {
                 self.console.log(format!(
@@ -339,6 +361,12 @@ impl Harness {
         }
     }
 
+    fn take_device(&mut self) -> io::Result<MdbDevice> {
+        self.device
+            .take()
+            .ok_or_else(|| io::Error::other("MDB device is already in use"))
+    }
+
     fn is_interrupted(&self) -> bool {
         self.interrupted.load(Ordering::Relaxed)
     }
@@ -363,22 +391,29 @@ enum RoundOutcome {
 struct WatchResult {
     vend_success: bool,
     vend_failure: bool,
-    session_complete: bool,
-    vended_selection: Option<Selection>,
+    session_ended: bool,
+    vended_item: Option<ItemNumber>,
     names: BTreeSet<&'static str>,
 }
 
 impl WatchResult {
-    fn record(&mut self, event: VmcEvent) {
+    fn record(&mut self, event: &SessionEvent) {
         self.names.insert(event.name());
         match event {
-            VmcEvent::VendSuccess { selection } => {
+            SessionEvent::VendSucceeded { reported_item, .. } => {
                 self.vend_success = true;
-                self.vended_selection = selection;
+                self.vended_item = *reported_item;
             }
-            VmcEvent::VendFailure => self.vend_failure = true,
-            VmcEvent::SessionComplete => self.session_complete = true,
-            _ => {}
+            SessionEvent::VendFailed { .. } => self.vend_failure = true,
+            SessionEvent::Ended { reason } => {
+                self.session_ended = true;
+                if *reason != SessionEndReason::Completed {
+                    self.names.insert("abnormal_session_end");
+                }
+            }
+            SessionEvent::VendRequested(_)
+            | SessionEvent::VendCancelled { .. }
+            | SessionEvent::VendDecisionExpired { .. } => {}
         }
     }
 
@@ -391,7 +426,25 @@ impl WatchResult {
     }
 }
 
-fn show_fake_qr(console: &Console, selection: Selection, price: Price) {
+fn format_money(amount: Level1Amount) -> String {
+    let raw = amount.raw();
+    let dollars = raw / 10;
+    let cents = (raw % 10) * 10;
+    format!("${dollars}.{cents:02}")
+}
+
+fn format_ap113_item(item: ItemNumber) -> String {
+    let [row, column] = item.bytes();
+    if row < 26 {
+        format!("{}{}", char::from(b'A' + row), column)
+    } else {
+        format!("{item}")
+    }
+}
+
+fn show_fake_qr(console: &Console, item: ItemNumber, price: Level1Amount) {
+    let selection = format_ap113_item(item);
+    let formatted_price = format_money(price);
     let payload = format!("lnbc-FAKE-{selection}-{}", price.raw());
     console.log(format!(
         concat!(
@@ -401,13 +454,13 @@ fn show_fake_qr(console: &Console, selection: Selection, price: Price) {
             "        |     [ QR CODE WOULD APPEAR HERE ]   |\n",
             "        |                                     |\n",
             "        |{selection:^37}|\n",
-            "        |{price:^37}|\n",
+            "        |{formatted_price:^37}|\n",
             "        |                                     |\n",
             "        +-------------------------------------+\n",
             "        payload: {payload}\n",
         ),
         selection = selection,
-        price = price,
+        formatted_price = formatted_price,
         payload = payload,
     ));
 }

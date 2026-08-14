@@ -305,8 +305,14 @@ cargo run --release --bin mdb-flow-test -- \
   --port /dev/serial/by-id/usb-Prolific* --funds 1345
 ```
 
-`--funds 1345` is the machine's max price. `--clear` sends `07 END SESSION` and
-exits, which unsticks a machine parked on a credit display.
+`--funds 1345` is the machine's max price. The legacy Python harness still has
+a diagnostic `--clear` option, but the Rust device API intentionally does not
+expose an unconditional `END SESSION`: it performs the state-appropriate
+cancel/deny/complete handshake instead.
+
+Known protocol, recovery, and hardware-qualification gaps in the async actor
+are tracked in [`MDB_ACTOR_FOLLOW_UPS.md`](MDB_ACTOR_FOLLOW_UPS.md). Treat the
+current actor as a development checkpoint until those items are closed.
 
 ---
 

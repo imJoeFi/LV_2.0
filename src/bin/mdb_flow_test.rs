@@ -35,10 +35,6 @@ struct Args {
     /// Raw Begin Session funds (decimal, or prefixed with 0x/0o/0b).
     #[arg(long, default_value = "0xFFFF", value_parser = parse_int::parse::<u16>)]
     funds: u16,
-
-    /// Send END SESSION to unstick the machine, then exit.
-    #[arg(long)]
-    clear: bool,
 }
 
 fn parse_timeout(value: &str) -> Result<Duration, String> {
@@ -52,8 +48,8 @@ fn parse_timeout(value: &str) -> Result<Duration, String> {
     }
 }
 
-fn run(args: Args) -> io::Result<()> {
-    if !io::stdin().is_terminal() && !args.clear {
+async fn run(args: Args) -> io::Result<()> {
+    if !io::stdin().is_terminal() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "this needs an interactive terminal for the y/n prompt",
@@ -66,16 +62,13 @@ fn run(args: Args) -> io::Result<()> {
         .map_err(|error| io::Error::other(format!("could not install Ctrl+C handler: {error}")))?;
 
     let config = HarnessConfig::new(args.port, args.baud, args.timeout, args.funds);
-    let mut harness = Harness::open(config, interrupted)?;
-    if args.clear {
-        harness.clear_session()
-    } else {
-        harness.run()
-    }
+    let mut harness = Harness::open(config, interrupted).await?;
+    harness.run().await
 }
 
-fn main() {
-    if let Err(error) = run(Args::parse()) {
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    if let Err(error) = run(Args::parse()).await {
         eprintln!("mdb-flow-test: {error}");
         std::process::exit(1);
     }
@@ -92,7 +85,6 @@ mod tests {
         assert_eq!(args.baud, 9600);
         assert_eq!(args.timeout, Duration::from_secs(45));
         assert_eq!(args.funds, 0xffff);
-        assert!(!args.clear);
     }
 
     #[test]

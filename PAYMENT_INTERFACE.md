@@ -43,7 +43,7 @@ status(id) -> "pending" | "settled" | "dead"
 
 Polled, non-blocking, roughly every 400 ms.
 
-- `settled` → we send `05 VEND APPROVED` and the machine dispenses
+- `settled` → we send `05 VEND APPROVED` and the machine attempts to dispense
 - `dead` → expired, cancelled, or otherwise unpayable; we release the machine
 - `pending` → keep waiting
 
@@ -121,18 +121,31 @@ alone is worth several modules.
 - `05 VEND APPROVED` is sent **only** on `settled`, never speculatively
 - The machine is always released, on every path — settled, dead, or timed out
 
-## What our side does not do
+## Failure and refund responsibility
 
-- Refunds. MDB has no mechanism for it, and there is no change to give
-- Partial payments or credit carried between sessions
-- Retries after a vend has been approved
+MDB does not move Lightning funds, but it does report whether the product was
+actually dispensed. After `VEND APPROVED`, the payment side must correlate the
+MDB vend ID with its payment ID and handle both outcomes durably:
+
+- `VEND SUCCESS`, or `RESET` after approval → treat the purchase as dispensed
+- `VEND FAILURE` → void an authorization or refund a settled payment
+- `VEND CANCEL` before approval → invalidate the vend and cancel any pending
+  payment request
+
+An authorize/hold followed by capture on vend success is preferable when the
+payment backend supports it. If payment must settle before MDB approval, the
+refund operation must be idempotent and survive a process restart.
+
+Our side does not carry partial payment or credit between sessions.
 
 ---
 
 ## Status
 
-Machine side: **working on real hardware.** Full flow confirmed 2026-08-08 —
-selection, price, approval, dispense, session teardown, re-arm.
+The original synchronous machine flow is **working on real hardware.** Full
+flow was confirmed 2026-08-08 — selection, price, approval, dispense, session
+teardown, re-arm. The Tokio actor refactor has simulated-adapter coverage for
+the Level 1 lifecycle but still requires another hardware qualification pass.
 
 Payment side: not started. `mdb/mdb_flow_test.py` stands in for it with a
 `y`/`n` prompt, which is exactly where `status()` will slot in.
