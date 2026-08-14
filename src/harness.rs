@@ -1,7 +1,9 @@
 use crate::device::{
     MdbConfig, MdbDevice, MdbSession, PendingVend, SessionEndReason, SessionEvent, SessionFunds,
 };
-use crate::protocol::{ItemNumber, Level1Amount};
+use crate::protocol::{
+    DisplayCharacterSet, DisplayDimensions, DisplayTime, ItemNumber, Level1Amount,
+};
 use crate::terminal::{flush_input, read_key, timestamp, Cbreak, Console};
 use std::collections::BTreeSet;
 use std::io;
@@ -11,12 +13,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SETTLE_WATCH: Duration = Duration::from_secs(10);
+const VMC_DISPLAY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const VMC_DISPLAY_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+const AP113_DISPLAY_COLUMNS: u8 = 16;
+const AP113_DISPLAY_ROWS: u8 = 1;
 
 pub struct HarnessConfig {
     port: PathBuf,
     baud: u32,
     payment_window: Duration,
     funds: SessionFunds,
+    vmc_display_message: Option<String>,
 }
 
 impl HarnessConfig {
@@ -27,7 +34,14 @@ impl HarnessConfig {
             baud,
             payment_window,
             funds,
+            vmc_display_message: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_vmc_display_message(mut self, message: impl Into<String>) -> Self {
+        self.vmc_display_message = Some(message.into());
+        self
     }
 }
 
@@ -42,8 +56,11 @@ impl Harness {
     pub async fn open(config: HarnessConfig, interrupted: Arc<AtomicBool>) -> io::Result<Self> {
         let console = Console::default();
         let trace_console = console.clone();
+        let display_dimensions = DisplayDimensions::new(AP113_DISPLAY_COLUMNS, AP113_DISPLAY_ROWS)
+            .map_err(io::Error::other)?;
         let mdb_config = MdbConfig::new(config.port.clone(), config.baud)
-            .with_application_response_time(config.payment_window + Duration::from_secs(1));
+            .with_application_response_time(config.payment_window + Duration::from_secs(1))
+            .with_display_fallback(display_dimensions, DisplayCharacterSet::FullAscii);
         let device = MdbDevice::connect_with_trace(&mdb_config, move |message| {
             trace_console.log(format!("{}  {message}", timestamp()));
         })
@@ -110,6 +127,11 @@ impl Harness {
             )),
             SessionFunds::Unknown => self.console.log("funds    0xFFFF (MDB unknown funds)"),
             SessionFunds::MachineMaximum => self.console.log("funds    machine maximum"),
+        }
+        if let Some(message) = &self.config.vmc_display_message {
+            self.console.log(format!(
+                "display  {message:?} on the VMC while awaiting selection"
+            ));
         }
         self.console.log(format!(
             "scale    raw x 10 / 10^2 -- so raw 1345 = {}",
@@ -214,9 +236,18 @@ impl Harness {
         mut session: MdbSession,
     ) -> io::Result<(MdbSession, Option<PendingVend>)> {
         let mut waited = Duration::ZERO;
+        let mut next_display = self
+            .config
+            .vmc_display_message
+            .as_ref()
+            .map(|_| Instant::now() + VMC_DISPLAY_INITIAL_DELAY);
         loop {
             if self.is_interrupted() {
                 return Ok((session, None));
+            }
+            if next_display.is_some_and(|deadline| Instant::now() >= deadline) {
+                self.refresh_vmc_display(&session).await?;
+                next_display = Some(Instant::now() + VMC_DISPLAY_REFRESH_INTERVAL);
             }
             let Some(event) = session.receive_event(Duration::from_secs(1)).await? else {
                 waited += Duration::from_secs(1);
@@ -241,6 +272,12 @@ impl Harness {
                         .begin_session(self.config.funds)
                         .await
                         .map_err(io::Error::other)?;
+                    waited = Duration::ZERO;
+                    next_display = self
+                        .config
+                        .vmc_display_message
+                        .as_ref()
+                        .map(|_| Instant::now() + VMC_DISPLAY_INITIAL_DELAY);
                 }
                 SessionEvent::VendCancelled { .. }
                 | SessionEvent::VendDecisionExpired { .. }
@@ -248,6 +285,16 @@ impl Harness {
                 | SessionEvent::VendFailed { .. } => {}
             }
         }
+    }
+
+    async fn refresh_vmc_display(&self, session: &MdbSession) -> io::Result<()> {
+        if let Some(message) = &self.config.vmc_display_message {
+            session
+                .display_message(message, DisplayTime::MAX)
+                .await
+                .map_err(io::Error::other)?;
+        }
+        Ok(())
     }
 
     fn wait_for_payment(&self, session: &mut MdbSession) -> io::Result<PaymentResult> {

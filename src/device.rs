@@ -1,5 +1,8 @@
 use crate::link::{open_serial, Link, TraceSink};
-use crate::protocol::{AdapterMessage, ItemNumber, Level1Amount, ReaderCommand, VmcEvent};
+use crate::protocol::{
+    AdapterMessage, DisplayCharacterSet, DisplayDimensions, DisplayTime, ItemNumber, Level1Amount,
+    ReaderCommand, VmcEvent,
+};
 use std::error::Error;
 use std::fmt;
 use std::future::pending;
@@ -22,6 +25,7 @@ pub struct MdbConfig {
     port: PathBuf,
     baud: u32,
     application_response_time: Duration,
+    display_fallback: Option<(DisplayDimensions, DisplayCharacterSet)>,
 }
 
 impl MdbConfig {
@@ -36,6 +40,7 @@ impl MdbConfig {
             port,
             baud,
             application_response_time: DEFAULT_APPLICATION_RESPONSE_TIME,
+            display_fallback: None,
         }
     }
 
@@ -45,6 +50,20 @@ impl MdbConfig {
     /// This does not reprogram the adapter's stored MDB reader configuration.
     pub fn with_application_response_time(mut self, timeout: Duration) -> Self {
         self.application_response_time = timeout;
+        self
+    }
+
+    /// Supplies display capabilities when the adapter completed MDB setup
+    /// before this process connected.
+    ///
+    /// A later `SETUP/CONFIGURATION` message from the VMC overrides this hint.
+    #[must_use]
+    pub fn with_display_fallback(
+        mut self,
+        dimensions: DisplayDimensions,
+        character_set: DisplayCharacterSet,
+    ) -> Self {
+        self.display_fallback = Some((dimensions, character_set));
         self
     }
 
@@ -58,6 +77,10 @@ impl MdbConfig {
 
     pub const fn application_response_time(&self) -> Duration {
         self.application_response_time
+    }
+
+    pub const fn display_fallback(&self) -> Option<(DisplayDimensions, DisplayCharacterSet)> {
+        self.display_fallback
     }
 }
 
@@ -128,6 +151,14 @@ pub enum MdbError {
         state: &'static str,
     },
     MachineMaximumUnknown,
+    DisplayConfigurationUnknown,
+    DisplayUnavailable,
+    UnsupportedDisplayCharacterSet(u8),
+    DisplayMessageTooLong {
+        length: usize,
+        capacity: usize,
+    },
+    UnsupportedDisplayCharacter(char),
 }
 
 impl fmt::Display for MdbError {
@@ -144,6 +175,24 @@ impl fmt::Display for MdbError {
             Self::MachineMaximumUnknown => {
                 formatter.write_str("the VMC has not supplied its maximum price")
             }
+            Self::DisplayConfigurationUnknown => formatter.write_str(
+                "the VMC display configuration was not observed and no fallback was configured",
+            ),
+            Self::DisplayUnavailable => {
+                formatter.write_str("the VMC reports no MDB-accessible display")
+            }
+            Self::UnsupportedDisplayCharacterSet(value) => write!(
+                formatter,
+                "the VMC reports unsupported display character set {value}"
+            ),
+            Self::DisplayMessageTooLong { length, capacity } => write!(
+                formatter,
+                "display message is {length} bytes but the VMC display accepts {capacity}"
+            ),
+            Self::UnsupportedDisplayCharacter(character) => write!(
+                formatter,
+                "character {character:?} is not supported by the VMC display"
+            ),
         }
     }
 }
@@ -168,6 +217,26 @@ struct DeviceHandle {
     device_events: broadcast::Receiver<DeviceEvent>,
 }
 
+impl DeviceHandle {
+    async fn display_message(
+        &self,
+        session_id: Option<SessionId>,
+        message: &str,
+        time: DisplayTime,
+    ) -> Result<(), MdbError> {
+        let (reply_sender, reply) = oneshot::channel();
+        self.commands
+            .send(ActorCommand::DisplayMessage {
+                session_id,
+                message: message.to_owned(),
+                time,
+                reply: reply_sender,
+            })
+            .map_err(|_| MdbError::Disconnected)?;
+        reply.await.map_err(|_| MdbError::Disconnected)?
+    }
+}
+
 /// An MDB reader connection with no application-owned session.
 #[must_use = "dropping the device disconnects the MDB actor"]
 pub struct MdbDevice {
@@ -188,6 +257,7 @@ impl MdbDevice {
         Ok(spawn_actor(
             stream,
             config.application_response_time(),
+            config.display_fallback(),
             Arc::new(trace),
         ))
     }
@@ -200,6 +270,11 @@ impl MdbDevice {
         DeviceEvents {
             receiver: self.handle.device_events.resubscribe(),
         }
+    }
+
+    /// Requests a message on the VMC display while no session is active.
+    pub async fn display_message(&self, message: &str, time: DisplayTime) -> Result<(), MdbError> {
+        self.handle.display_message(None, message, time).await
     }
 
     pub async fn begin_session(self, funds: SessionFunds) -> Result<MdbSession, BeginSessionError> {
@@ -374,6 +449,18 @@ impl MdbSession {
 
     pub const fn advertised_funds(&self) -> SessionFunds {
         self.funds
+    }
+
+    /// Requests a message on the VMC display while this session is idle.
+    pub async fn display_message(&self, message: &str, time: DisplayTime) -> Result<(), MdbError> {
+        self.handle
+            .as_ref()
+            .ok_or(MdbError::InvalidState {
+                operation: "display a message",
+                state: "the session is already finished",
+            })?
+            .display_message(Some(self.id), message, time)
+            .await
     }
 
     pub fn try_event(&mut self) -> Result<Option<SessionEvent>, MdbError> {
@@ -599,6 +686,12 @@ enum ActorCommand {
         events: mpsc::UnboundedSender<SessionEvent>,
         reply: oneshot::Sender<Result<(), MdbError>>,
     },
+    DisplayMessage {
+        session_id: Option<SessionId>,
+        message: String,
+        time: DisplayTime,
+        reply: oneshot::Sender<Result<(), MdbError>>,
+    },
     DecideVend {
         id: VendId,
         decision: VendDecision,
@@ -632,6 +725,43 @@ enum SessionPhase {
     AwaitingReset(Option<VendRecord>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayState {
+    Unknown,
+    Unavailable,
+    Available {
+        dimensions: DisplayDimensions,
+        character_set: DisplayCharacterSet,
+    },
+    UnsupportedCharacterSet(u8),
+}
+
+impl DisplayState {
+    fn from_fallback(fallback: Option<(DisplayDimensions, DisplayCharacterSet)>) -> Self {
+        fallback.map_or(Self::Unknown, |(dimensions, character_set)| {
+            Self::Available {
+                dimensions,
+                character_set,
+            }
+        })
+    }
+
+    fn from_setup(columns: u8, rows: u8, character_set: u8) -> Self {
+        let Ok(dimensions) = DisplayDimensions::new(columns, rows) else {
+            return Self::Unavailable;
+        };
+        let character_set = match character_set {
+            0 => DisplayCharacterSet::Basic,
+            1 => DisplayCharacterSet::FullAscii,
+            value => return Self::UnsupportedCharacterSet(value),
+        };
+        Self::Available {
+            dimensions,
+            character_set,
+        }
+    }
+}
+
 struct ActiveSession {
     id: SessionId,
     events: mpsc::UnboundedSender<SessionEvent>,
@@ -660,7 +790,12 @@ impl ActiveSession {
     }
 }
 
-fn spawn_actor<T>(io: T, application_response_time: Duration, trace: TraceSink) -> MdbDevice
+fn spawn_actor<T>(
+    io: T,
+    application_response_time: Duration,
+    display_fallback: Option<(DisplayDimensions, DisplayCharacterSet)>,
+    trace: TraceSink,
+) -> MdbDevice
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -679,6 +814,8 @@ where
         device_events,
         application_response_time,
         machine_maximum: None,
+        display_fallback,
+        display: DisplayState::from_fallback(display_fallback),
         active: None,
         completed: None,
         invalid_vends: Vec::new(),
@@ -704,6 +841,8 @@ struct Actor<T> {
     device_events: broadcast::Sender<DeviceEvent>,
     application_response_time: Duration,
     machine_maximum: Option<Level1Amount>,
+    display_fallback: Option<(DisplayDimensions, DisplayCharacterSet)>,
+    display: DisplayState,
     active: Option<ActiveSession>,
     completed: Option<SessionSummary>,
     invalid_vends: Vec<(VendId, VendDecisionError)>,
@@ -829,6 +968,19 @@ where
                     return Err(result.expect_err("checked above"));
                 }
             }
+            ActorCommand::DisplayMessage {
+                session_id,
+                message,
+                time,
+                reply,
+            } => {
+                let result = self.display_message(session_id, &message, time).await;
+                let fatal = result.as_ref().err().is_some_and(is_transport_error);
+                let _ = reply.send(result.clone());
+                if fatal {
+                    return Err(result.expect_err("checked above"));
+                }
+            }
             ActorCommand::DecideVend {
                 id,
                 decision,
@@ -849,6 +1001,86 @@ where
                 self.request_end_without_waiter().await?;
             }
         }
+        Ok(())
+    }
+
+    async fn display_message(
+        &mut self,
+        session_id: Option<SessionId>,
+        message: &str,
+        time: DisplayTime,
+    ) -> Result<(), MdbError> {
+        match session_id {
+            None if self.active.is_some() => {
+                return Err(MdbError::InvalidState {
+                    operation: "display a message without a session",
+                    state: "a session is active",
+                });
+            }
+            Some(id) => {
+                let Some(session) = &self.active else {
+                    return Err(MdbError::InvalidState {
+                        operation: "display a session message",
+                        state: "no session is active",
+                    });
+                };
+                if session.id != id {
+                    return Err(MdbError::InvalidState {
+                        operation: "display a session message",
+                        state: "a different session is active",
+                    });
+                }
+                if !matches!(session.phase, SessionPhase::Idle) {
+                    return Err(MdbError::InvalidState {
+                        operation: "display a session message",
+                        state: "the session is processing or ending a vend",
+                    });
+                }
+            }
+            None => {}
+        }
+
+        if matches!(*self.status.borrow(), DeviceStatus::Inactive) {
+            return Err(MdbError::InvalidState {
+                operation: "display a message",
+                state: "the reader has not completed MDB setup",
+            });
+        }
+
+        let (dimensions, character_set) = match self.display {
+            DisplayState::Unknown => return Err(MdbError::DisplayConfigurationUnknown),
+            DisplayState::Unavailable => return Err(MdbError::DisplayUnavailable),
+            DisplayState::UnsupportedCharacterSet(value) => {
+                return Err(MdbError::UnsupportedDisplayCharacterSet(value));
+            }
+            DisplayState::Available {
+                dimensions,
+                character_set,
+            } => (dimensions, character_set),
+        };
+
+        if let Some(character) = message.chars().find(|character| {
+            !character.is_ascii()
+                || !((' '..='~').contains(character))
+                || (character_set == DisplayCharacterSet::Basic
+                    && !matches!(character, '0'..='9' | 'A'..='Z' | ' ' | '.'))
+        }) {
+            return Err(MdbError::UnsupportedDisplayCharacter(character));
+        }
+
+        let capacity = dimensions.capacity();
+        if message.len() > capacity {
+            return Err(MdbError::DisplayMessageTooLong {
+                length: message.len(),
+                capacity,
+            });
+        }
+
+        let mut data = vec![b' '; capacity];
+        data[..message.len()].copy_from_slice(message.as_bytes());
+        self.link
+            .send(ReaderCommand::DisplayRequest { time, data })
+            .await?;
         Ok(())
     }
 
@@ -1058,8 +1290,15 @@ where
     async fn handle_vmc_event(&mut self, event: VmcEvent) -> Result<(), MdbError> {
         match event {
             VmcEvent::Reset => self.handle_reset(),
-            VmcEvent::SetupConfiguration { feature_level } => {
+            VmcEvent::SetupConfiguration {
+                feature_level,
+                display_columns,
+                display_rows,
+                display_character_set,
+            } => {
                 let _ = feature_level;
+                self.display =
+                    DisplayState::from_setup(display_columns, display_rows, display_character_set);
                 self.publish_status(DeviceStatus::Disabled);
             }
             VmcEvent::SetupPrices { maximum, minimum } => {
@@ -1324,6 +1563,7 @@ where
             self.invalidate_vend(vend.id, VendDecisionError::SessionEnded);
         }
         self.complete_active(SessionEndReason::Reset);
+        self.display = DisplayState::from_fallback(self.display_fallback);
         self.publish_status(DeviceStatus::Inactive);
         let _ = self.device_events.send(DeviceEvent::Reinitialized);
     }
@@ -1431,8 +1671,20 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_secs(1);
 
     fn fake_device(application_response_time: Duration) -> (MdbDevice, DuplexStream) {
+        fake_device_with_display(application_response_time, None)
+    }
+
+    fn fake_device_with_display(
+        application_response_time: Duration,
+        display_fallback: Option<(DisplayDimensions, DisplayCharacterSet)>,
+    ) -> (MdbDevice, DuplexStream) {
         let (driver, adapter) = duplex(4096);
-        let device = spawn_actor(driver, application_response_time, Arc::new(drop));
+        let device = spawn_actor(
+            driver,
+            application_response_time,
+            display_fallback,
+            Arc::new(drop),
+        );
         (device, adapter)
     }
 
@@ -1473,6 +1725,221 @@ mod tests {
             SessionEvent::VendRequested(vend) => vend,
             event => panic!("expected vend request, got {event:?}"),
         }
+    }
+
+    fn four_character_display() -> (DisplayDimensions, DisplayCharacterSet) {
+        (
+            DisplayDimensions::new(4, 1).unwrap(),
+            DisplayCharacterSet::FullAscii,
+        )
+    }
+
+    #[tokio::test]
+    async fn device_can_request_a_padded_vmc_display_message() {
+        let (device, mut adapter) =
+            fake_device_with_display(Duration::from_secs(1), Some(four_character_display()));
+
+        device
+            .display_message("PAY", DisplayTime::from_deciseconds(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reader(&mut adapter, 7).await,
+            [0x02, 0x0a, 0x50, 0x41, 0x59, 0x20, 0x16]
+        );
+        device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_display_does_not_change_the_vend_phase() {
+        let dimensions = DisplayDimensions::new(16, 1).unwrap();
+        let (device, mut adapter) = fake_device_with_display(
+            Duration::from_secs(1),
+            Some((dimensions, DisplayCharacterSet::FullAscii)),
+        );
+        let mut session = device.begin_session(known_funds(1345)).await.unwrap();
+        let _ = read_reader(&mut adapter, 4).await;
+        send_adapter_ack(&mut adapter).await;
+        tokio::task::yield_now().await;
+
+        session
+            .display_message("MAKE A SELECTION", DisplayTime::MAX)
+            .await
+            .unwrap();
+        let frame = read_reader(&mut adapter, 19).await;
+        assert_eq!(&frame[..2], [0x02, 0xff]);
+        assert_eq!(&frame[2..18], b"MAKE A SELECTION");
+        assert_eq!(
+            frame[18],
+            frame[..18]
+                .iter()
+                .fold(0_u8, |sum, byte| sum.wrapping_add(*byte))
+        );
+
+        send_vmc(&mut adapter, &[0x13, 0x00, 0x04, 0xe3, 0x00, 0x01]).await;
+        let vend = next_vend(&mut session).await;
+        vend.deny().await.unwrap();
+        let _ = read_reader(&mut adapter, 2).await;
+        send_vmc(&mut adapter, &[0x13, 0x04]).await;
+        let _ = read_reader(&mut adapter, 2).await;
+        let _ = session.next_event().await.unwrap();
+        let _ = session.finish().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_display_setup_overrides_the_fallback() {
+        let (device, mut adapter) =
+            fake_device_with_display(Duration::from_secs(1), Some(four_character_display()));
+        send_vmc(&mut adapter, &[0x11, 0x00, 0x03, 0x10, 0x01, 0x01]).await;
+        tokio::task::yield_now().await;
+
+        device
+            .display_message("MAKE A SELECTION", DisplayTime::MAX)
+            .await
+            .unwrap();
+        let frame = read_reader(&mut adapter, 19).await;
+        assert_eq!(&frame[2..18], b"MAKE A SELECTION");
+        device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn display_errors_are_specific_and_do_not_write_frames() {
+        let (device, _adapter) = fake_device(Duration::from_secs(1));
+        assert_eq!(
+            device.display_message("PAY", DisplayTime::MAX).await,
+            Err(MdbError::DisplayConfigurationUnknown)
+        );
+        device.shutdown().await.unwrap();
+
+        let (device, _adapter) =
+            fake_device_with_display(Duration::from_secs(1), Some(four_character_display()));
+        assert_eq!(
+            device.display_message("TOO LONG", DisplayTime::MAX).await,
+            Err(MdbError::DisplayMessageTooLong {
+                length: 8,
+                capacity: 4,
+            })
+        );
+        assert_eq!(
+            device.display_message("PAY ☃", DisplayTime::MAX).await,
+            Err(MdbError::UnsupportedDisplayCharacter('☃'))
+        );
+        device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn observed_display_capabilities_control_text_validation() {
+        let (device, mut adapter) = fake_device(Duration::from_secs(1));
+        send_vmc(&mut adapter, &[0x11, 0x00, 0x03, 0x04, 0x01, 0x00]).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            device.display_message("pay", DisplayTime::MAX).await,
+            Err(MdbError::UnsupportedDisplayCharacter('p'))
+        );
+        device
+            .display_message("PAY", DisplayTime::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reader(&mut adapter, 7).await,
+            [0x02, 0xff, 0x50, 0x41, 0x59, 0x20, 0x0b]
+        );
+        device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn setup_can_report_an_unavailable_or_unsupported_display() {
+        let (device, mut adapter) = fake_device(Duration::from_secs(1));
+        send_vmc(&mut adapter, &[0x11, 0x00, 0x03, 0x00, 0x01, 0x01]).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            device.display_message("PAY", DisplayTime::MAX).await,
+            Err(MdbError::DisplayUnavailable)
+        );
+        device.shutdown().await.unwrap();
+
+        let (device, mut adapter) = fake_device(Duration::from_secs(1));
+        send_vmc(&mut adapter, &[0x11, 0x00, 0x03, 0x04, 0x01, 0x02]).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            device.display_message("PAY", DisplayTime::MAX).await,
+            Err(MdbError::UnsupportedDisplayCharacterSet(2))
+        );
+        device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reset_restores_the_display_fallback_but_blocks_until_reenabled() {
+        let (device, mut adapter) =
+            fake_device_with_display(Duration::from_secs(1), Some(four_character_display()));
+        send_vmc(&mut adapter, &[0x11, 0x00, 0x03, 0x10, 0x01, 0x01]).await;
+        timeout(TEST_TIMEOUT, async {
+            while device.status() != DeviceStatus::Disabled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        send_vmc(&mut adapter, &[0x10]).await;
+        timeout(TEST_TIMEOUT, async {
+            while device.status() != DeviceStatus::Inactive {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            device.display_message("PAY", DisplayTime::MAX).await,
+            Err(MdbError::InvalidState {
+                operation: "display a message",
+                state: "the reader has not completed MDB setup",
+            })
+        );
+
+        send_vmc(&mut adapter, &[0x14, 0x01]).await;
+        timeout(TEST_TIMEOUT, async {
+            while device.status() != DeviceStatus::Enabled {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        device
+            .display_message("PAY", DisplayTime::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_reader(&mut adapter, 7).await,
+            [0x02, 0xff, 0x50, 0x41, 0x59, 0x20, 0x0b]
+        );
+        device.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_display_is_rejected_once_a_vend_is_underway() {
+        let (device, mut adapter) =
+            fake_device_with_display(Duration::from_secs(1), Some(four_character_display()));
+        let mut session = device.begin_session(known_funds(1345)).await.unwrap();
+        let _ = read_reader(&mut adapter, 4).await;
+        send_vmc(&mut adapter, &[0x13, 0x00, 0x04, 0xe3, 0x00, 0x01]).await;
+        let vend = next_vend(&mut session).await;
+
+        assert_eq!(
+            session.display_message("PAY", DisplayTime::MAX).await,
+            Err(MdbError::InvalidState {
+                operation: "display a session message",
+                state: "the session is processing or ending a vend",
+            })
+        );
+
+        vend.deny().await.unwrap();
+        let _ = read_reader(&mut adapter, 2).await;
+        send_vmc(&mut adapter, &[0x13, 0x04]).await;
+        let _ = read_reader(&mut adapter, 2).await;
+        let _ = session.next_event().await.unwrap();
+        let _ = session.finish().await.unwrap();
     }
 
     #[tokio::test]

@@ -214,14 +214,34 @@ So the power-on MAX/MIN PRICE of `0x0541` / `0x0032` means **$134.50 / $5.00**,
 and A1's `1251` is **$125.10**. Those are clearly not snack prices — the
 machine's own prices need setting via `SET PRICE` in the service menu.
 
-### `0xFFFF` is NOT honoured as "funds unknown"
+### The AP 113 incorrectly displays `0xFFFF` unknown funds
 
-The VMC displays it literally, as **$655.35**. Selections still work, because
-everything is affordable at that figure, but a machine advertising a fake
-$655.35 balance is not shippable.
+MDB defines `0xFFFF` as "not yet determined" and says it should allow selection
+without displaying a balance. The best-practices appendix recommends an
+appropriate prompt such as "Please make a selection" instead. This VMC renders
+a bogus `$655.xx` balance (most recently observed as **$655.26**), so this is a
+VMC interoperability bug rather than usable credit.
 
-Send a real credit figure instead, at least the machine's max price (`0x0541`).
-Anything lower makes the dearest selections unaffordable.
+The Rust harness can cover it with an MDB `DISPLAY REQUEST` while waiting for a
+selection:
+
+```bash
+cargo run --release --bin mdb-flow-test -- \
+  --port /dev/serial/by-id/usb-Prolific* \
+  --funds 0xFFFF \
+  --vmc-display-message "MAKE A SELECTION"
+```
+
+The AP 113 reports a 16x1 full-ASCII display. Shorter messages are padded to 16
+characters; longer or non-printable messages are rejected. The harness requests
+the MDB maximum display time of 25.5 seconds and refreshes every 20 seconds until
+the customer selects an item, at which point it stops so it does not cover the
+VMC's transaction status. This path has simulated-adapter coverage but still
+needs physical qualification.
+
+Alternatively, send a real credit figure at least as large as the machine's
+maximum price (`0x0541`). Anything lower makes the dearest selections
+unaffordable.
 
 ### Sessions must be explicitly closed
 
@@ -304,6 +324,9 @@ Rust equivalent:
 cargo run --release --bin mdb-flow-test -- \
   --port /dev/serial/by-id/usb-Prolific* --funds 1345
 ```
+
+Add `--vmc-display-message "MAKE A SELECTION"` when using `--funds 0xFFFF` to
+replace this VMC's incorrect `$655.xx` rendering with a selection prompt.
 
 `--funds 1345` is the machine's max price. The legacy Python harness still has
 a diagnostic `--clear` option, but the Rust device API intentionally does not

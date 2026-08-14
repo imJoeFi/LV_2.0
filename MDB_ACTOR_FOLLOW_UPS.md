@@ -21,6 +21,11 @@ This is especially dangerous for `VEND APPROVED`: a later `RESET` can be
 reported as `VendSucceeded::AssumedAfterReset` even if the approval was never
 accepted by the VMC.
 
+`DISPLAY REQUEST` has the same acknowledgement limitation. The harness waits a
+second after `BEGIN SESSION` before its first display request to avoid writing
+two responses back-to-back, but that delay is only a best-effort workaround and
+does not prove that the adapter or VMC accepted either response.
+
 Before release:
 
 - qualify the WAFER adapter's exact host-side ACK/NAK/RET contract;
@@ -112,7 +117,8 @@ new response against the AP 113 before replacing the proven harness in service.
 - A power-cycle capture proves initialization and advertised configuration.
 - Restart recovery is tested with a deliberately stale session.
 - Approve, deny, timeout, VMC cancel, vend success, vend failure, reader disable,
-  and unexpected-command paths are exercised on the physical machine.
+  display request, and unexpected-command paths are exercised on the physical
+  machine.
 - Payment/refund outcomes remain correct across process termination and restart.
 
 Relevant specification sections are MDB/ICP 4.3 sections 2.4, 7.3, 7.4, 7.5,

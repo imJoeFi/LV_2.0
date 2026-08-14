@@ -1,7 +1,9 @@
 use std::error::Error;
 use std::fmt;
+use std::time::Duration;
 
 const MAX_BUFFER_SIZE: usize = 4096;
+const MAX_DISPLAY_DATA_LENGTH: usize = 32;
 const UNKNOWN_AMOUNT: u16 = u16::MAX;
 
 /// A numeric MDB Level 1 monetary value.
@@ -70,9 +72,110 @@ impl fmt::Display for ItemNumber {
     }
 }
 
+/// Time requested for an MDB message on the VMC display, in 0.1-second units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DisplayTime(u8);
+
+impl DisplayTime {
+    /// The longest display request representable by MDB: 25.5 seconds.
+    pub const MAX: Self = Self(u8::MAX);
+
+    pub const fn from_deciseconds(deciseconds: u8) -> Self {
+        Self(deciseconds)
+    }
+
+    pub const fn as_deciseconds(self) -> u8 {
+        self.0
+    }
+
+    pub const fn duration(self) -> Duration {
+        Duration::from_millis(self.0 as u64 * 100)
+    }
+}
+
+impl TryFrom<Duration> for DisplayTime {
+    type Error = InvalidDisplayTime;
+
+    fn try_from(duration: Duration) -> Result<Self, Self::Error> {
+        const DECISECOND_NANOS: u128 = 100_000_000;
+
+        let nanoseconds = duration.as_nanos();
+        if !nanoseconds.is_multiple_of(DECISECOND_NANOS) {
+            return Err(InvalidDisplayTime);
+        }
+        let deciseconds = nanoseconds / DECISECOND_NANOS;
+        u8::try_from(deciseconds)
+            .map(Self)
+            .map_err(|_| InvalidDisplayTime)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDisplayTime;
+
+impl fmt::Display for InvalidDisplayTime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("display time must be an exact 0.1-second value from 0 to 25.5 seconds")
+    }
+}
+
+impl Error for InvalidDisplayTime {}
+
+/// Geometry reported by the VMC for its MDB-accessible display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DisplayDimensions {
+    columns: u8,
+    rows: u8,
+}
+
+impl DisplayDimensions {
+    pub const fn new(columns: u8, rows: u8) -> Result<Self, InvalidDisplayDimensions> {
+        if columns == 0 || rows == 0 {
+            Err(InvalidDisplayDimensions)
+        } else {
+            Ok(Self { columns, rows })
+        }
+    }
+
+    pub const fn columns(self) -> u8 {
+        self.columns
+    }
+
+    pub const fn rows(self) -> u8 {
+        self.rows
+    }
+
+    pub fn capacity(self) -> usize {
+        usize::from(self.columns)
+            .saturating_mul(usize::from(self.rows))
+            .min(MAX_DISPLAY_DATA_LENGTH)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidDisplayDimensions;
+
+impl fmt::Display for InvalidDisplayDimensions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("MDB display dimensions must have at least one row and one column")
+    }
+}
+
+impl Error for InvalidDisplayDimensions {}
+
+/// Character repertoire advertised by the VMC for its display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisplayCharacterSet {
+    /// Digits, uppercase letters, spaces, and decimal points.
+    Basic,
+    /// Printable ASCII.
+    FullAscii,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReaderCommand {
     BeginSession(u16),
+    DisplayRequest { time: DisplayTime, data: Vec<u8> },
     SessionCancel,
     Approve(Level1Amount),
     Deny,
@@ -82,11 +185,17 @@ pub enum ReaderCommand {
 }
 
 impl ReaderCommand {
-    fn payload(self) -> Vec<u8> {
+    fn payload(&self) -> Vec<u8> {
         match self {
             Self::BeginSession(funds) => {
                 let [high, low] = funds.to_be_bytes();
                 vec![0x03, high, low]
+            }
+            Self::DisplayRequest { time, data } => {
+                let mut payload = Vec::with_capacity(data.len() + 2);
+                payload.extend([0x02, time.as_deciseconds()]);
+                payload.extend(data);
+                payload
             }
             Self::SessionCancel => vec![0x04],
             Self::Approve(amount) => {
@@ -100,7 +209,7 @@ impl ReaderCommand {
         }
     }
 
-    pub fn frame(self) -> Vec<u8> {
+    pub fn frame(&self) -> Vec<u8> {
         let mut payload = self.payload();
         payload.push(checksum(&payload));
         payload
@@ -114,6 +223,12 @@ impl fmt::Display for ReaderCommand {
                 formatter.write_str("BEGIN SESSION (funds unknown)")
             }
             Self::BeginSession(funds) => write!(formatter, "BEGIN SESSION (funds={funds})"),
+            Self::DisplayRequest { time, data } => write!(
+                formatter,
+                "DISPLAY REQUEST ({:.1}s, {:?})",
+                time.duration().as_secs_f64(),
+                String::from_utf8_lossy(data).trim_end()
+            ),
             Self::SessionCancel => formatter.write_str("SESSION CANCEL REQUEST"),
             Self::Approve(amount) => write!(formatter, "VEND APPROVED (amount={})", amount.raw()),
             Self::Deny => formatter.write_str("VEND DENIED"),
@@ -129,6 +244,9 @@ pub enum VmcEvent {
     Reset,
     SetupConfiguration {
         feature_level: u8,
+        display_columns: u8,
+        display_rows: u8,
+        display_character_set: u8,
     },
     SetupPrices {
         maximum: Option<Level1Amount>,
@@ -217,9 +335,14 @@ pub fn parse_adapter_message(bytes: &[u8]) -> Result<AdapterMessage, ProtocolErr
     let payload = &bytes[..bytes.len() - 1];
     let event = match payload {
         [0x10] => VmcEvent::Reset,
-        [0x11, 0x00, feature_level, _, _, _] => VmcEvent::SetupConfiguration {
-            feature_level: *feature_level,
-        },
+        [0x11, 0x00, feature_level, display_columns, display_rows, display_info] => {
+            VmcEvent::SetupConfiguration {
+                feature_level: *feature_level,
+                display_columns: *display_columns,
+                display_rows: *display_rows,
+                display_character_set: *display_info & 0b111,
+            }
+        }
         [0x11, 0x01, maximum_high, maximum_low, minimum_high, minimum_low] => {
             VmcEvent::SetupPrices {
                 maximum: optional_amount(*maximum_high, *maximum_low),
@@ -345,6 +468,35 @@ mod tests {
     }
 
     #[test]
+    fn display_time_uses_exact_deciseconds() {
+        assert_eq!(
+            DisplayTime::try_from(Duration::from_millis(100)),
+            Ok(DisplayTime::from_deciseconds(1))
+        );
+        assert_eq!(
+            DisplayTime::try_from(Duration::from_millis(25_500)),
+            Ok(DisplayTime::MAX)
+        );
+        assert_eq!(
+            DisplayTime::try_from(Duration::from_millis(150)),
+            Err(InvalidDisplayTime)
+        );
+        assert_eq!(
+            DisplayTime::try_from(Duration::from_millis(25_600)),
+            Err(InvalidDisplayTime)
+        );
+    }
+
+    #[test]
+    fn display_dimensions_are_nonzero_and_cap_messages_at_32_bytes() {
+        let dimensions = DisplayDimensions::new(20, 2).unwrap();
+        assert_eq!(dimensions.columns(), 20);
+        assert_eq!(dimensions.rows(), 2);
+        assert_eq!(dimensions.capacity(), 32);
+        assert_eq!(DisplayDimensions::new(0, 1), Err(InvalidDisplayDimensions));
+    }
+
+    #[test]
     fn level_one_responses_have_the_required_checksums() {
         assert_eq!(
             ReaderCommand::BeginSession(100).frame(),
@@ -358,6 +510,27 @@ mod tests {
         assert_eq!(ReaderCommand::Deny.frame(), [0x06, 0x06]);
         assert_eq!(ReaderCommand::EndSession.frame(), [0x07, 0x07]);
         assert_eq!(ReaderCommand::Cancelled.frame(), [0x08, 0x08]);
+        assert_eq!(
+            ReaderCommand::DisplayRequest {
+                time: DisplayTime::from_deciseconds(10),
+                data: b"PAY ".to_vec(),
+            }
+            .frame(),
+            [0x02, 0x0a, 0x50, 0x41, 0x59, 0x20, 0x16]
+        );
+    }
+
+    #[test]
+    fn display_request_supports_the_32_byte_mdb_maximum() {
+        let frame = ReaderCommand::DisplayRequest {
+            time: DisplayTime::MAX,
+            data: vec![b'A'; 32],
+        }
+        .frame();
+        assert_eq!(frame.len(), 35);
+        assert_eq!(&frame[..2], [0x02, 0xff]);
+        assert_eq!(&frame[2..34], [b'A'; 32]);
+        assert_eq!(frame[34], checksum(&frame[..34]));
     }
 
     #[test]
@@ -387,6 +560,19 @@ mod tests {
             Ok(AdapterMessage::Vmc(VmcEvent::VendRequest {
                 price: Level1Amount::new(1251).unwrap(),
                 item: ItemNumber::new(0x0102),
+            }))
+        );
+    }
+
+    #[test]
+    fn parses_vmc_display_capabilities() {
+        assert_eq!(
+            parse_adapter_message(&[0x11, 0x00, 0x03, 0x10, 0x01, 0x01, 0x26]),
+            Ok(AdapterMessage::Vmc(VmcEvent::SetupConfiguration {
+                feature_level: 3,
+                display_columns: 16,
+                display_rows: 1,
+                display_character_set: 1,
             }))
         );
     }

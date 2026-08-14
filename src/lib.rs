@@ -13,4 +13,7 @@ pub use device::{
     SessionSummary, VendDecisionError, VendId, VendSuccessEvidence,
 };
 pub use harness::{Harness, HarnessConfig};
-pub use protocol::{InvalidAmount, ItemNumber, Level1Amount};
+pub use protocol::{
+    DisplayCharacterSet, DisplayDimensions, DisplayTime, InvalidAmount, InvalidDisplayDimensions,
+    InvalidDisplayTime, ItemNumber, Level1Amount,
+};
