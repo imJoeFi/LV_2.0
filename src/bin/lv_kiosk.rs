@@ -3,7 +3,8 @@ mod mdb;
 
 use clap::Parser;
 use iced::widget::{
-    button, column, container, image, rich_text, row, scrollable, span, text, Column, Row,
+    button, column, container, image, mouse_area, operation, rich_text, row, scrollable, span,
+    text, Column, Id, Row,
 };
 use iced::{time, window, Element, Length, Size, Subscription, Task, Theme};
 use lv_mdb_tools::kiosk::{
@@ -98,10 +99,10 @@ impl ApplicationState {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        if let Self::Running(app) = self {
-            app.update(message);
+        match self {
+            Self::Running(app) => app.update(message),
+            Self::Failed(_) => Task::none(),
         }
-        Task::none()
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -157,6 +158,33 @@ struct KioskApp {
     next_code_attempt: Option<Instant>,
     invalid_admin_attempts: u32,
     admin_locked_until: Option<Instant>,
+    catalog_scroll_id: Id,
+    catalog_drag: PointerDrag,
+}
+
+#[derive(Default)]
+struct PointerDrag {
+    cursor_y: Option<f32>,
+    active: bool,
+}
+
+impl PointerDrag {
+    fn move_to(&mut self, cursor_y: f32) -> Option<f32> {
+        let delta = self
+            .active
+            .then(|| self.cursor_y.map(|previous_y| previous_y - cursor_y))
+            .flatten();
+        self.cursor_y = Some(cursor_y);
+        delta.filter(|delta| delta.abs() > f32::EPSILON)
+    }
+
+    fn press(&mut self) {
+        self.active = self.cursor_y.is_some();
+    }
+
+    const fn release(&mut self) {
+        self.active = false;
+    }
 }
 
 enum Backend {
@@ -249,6 +277,9 @@ enum Message {
     InventoryChange(SlotId, i32),
     MarkSlotResolved(SlotId),
     ResolveUncertain(TransactionId, bool),
+    CatalogPointerMoved(f32),
+    CatalogPointerPressed,
+    CatalogPointerReleased,
 }
 
 impl KioskApp {
@@ -310,10 +341,16 @@ impl KioskApp {
             next_code_attempt: None,
             invalid_admin_attempts: 0,
             admin_locked_until: None,
+            catalog_scroll_id: Id::unique(),
+            catalog_drag: PointerDrag::default(),
         })
     }
 
-    fn update(&mut self, message: Message) {
+    fn update(&mut self, message: Message) -> Task<Message> {
+        if let Some(task) = self.update_catalog_drag(&message) {
+            return task;
+        }
+
         match message {
             Message::Tick(now) => self.tick(now),
             Message::PollMdb => self.poll_mdb(),
@@ -403,6 +440,35 @@ impl KioskApp {
             Message::ResolveUncertain(id, dispensed) => {
                 self.resolve_uncertain(id, dispensed);
             }
+            Message::CatalogPointerMoved(_)
+            | Message::CatalogPointerPressed
+            | Message::CatalogPointerReleased => unreachable!("handled before the main update"),
+        }
+
+        Task::none()
+    }
+
+    fn update_catalog_drag(&mut self, message: &Message) -> Option<Task<Message>> {
+        match message {
+            Message::CatalogPointerMoved(cursor_y) => Some(
+                self.catalog_drag
+                    .move_to(*cursor_y)
+                    .map_or_else(Task::none, |delta_y| {
+                        operation::scroll_by(
+                            self.catalog_scroll_id.clone(),
+                            scrollable::AbsoluteOffset { x: 0.0, y: delta_y },
+                        )
+                    }),
+            ),
+            Message::CatalogPointerPressed => {
+                self.catalog_drag.press();
+                Some(Task::none())
+            }
+            Message::CatalogPointerReleased => {
+                self.catalog_drag.release();
+                Some(Task::none())
+            }
+            _ => None,
         }
     }
 
@@ -1064,13 +1130,31 @@ impl KioskApp {
         .style(button::primary)
         .on_press(Message::OpenPromo);
 
+        let catalog = scrollable(self.catalog_grid())
+            .id(self.catalog_scroll_id.clone())
+            .direction(scrollable::Direction::Vertical(
+                scrollable::Scrollbar::new()
+                    .width(24)
+                    .scroller_width(16)
+                    .margin(4)
+                    .spacing(8),
+            ))
+            .width(Length::Fill)
+            .height(Length::Fill);
+        let draggable_catalog = mouse_area(catalog)
+            .on_move(|position| Message::CatalogPointerMoved(position.y))
+            .on_press(Message::CatalogPointerPressed)
+            .on_release(Message::CatalogPointerReleased)
+            .on_exit(Message::CatalogPointerReleased);
+
         let content = column![
             header,
             self.notice_view(),
             promo,
             text("Paying with Lightning?").size(20),
             text("Enter a Lightning item on the vending machine keypad."),
-            scrollable(self.catalog_grid()).height(Length::Fill),
+            text("Swipe the item list to browse.").size(13),
+            draggable_catalog,
             self.machine_controls()
         ]
         .spacing(14);
@@ -1738,5 +1822,18 @@ mod tests {
         let hardware = Args::try_parse_from(["lv-kiosk", "--port", "/dev/ttyUSB0"]).unwrap();
         assert_eq!(hardware.port, Some(PathBuf::from("/dev/ttyUSB0")));
         assert_eq!(hardware.baud, 9600);
+    }
+
+    #[test]
+    fn pointer_drag_tracks_content_in_both_directions() {
+        let mut drag = PointerDrag::default();
+        assert_eq!(drag.move_to(200.0), None);
+
+        drag.press();
+        assert_eq!(drag.move_to(175.0), Some(25.0));
+        assert_eq!(drag.move_to(190.0), Some(-15.0));
+
+        drag.release();
+        assert_eq!(drag.move_to(150.0), None);
     }
 }
