@@ -1,12 +1,14 @@
 #[path = "lv_kiosk/mdb.rs"]
 mod mdb;
+#[path = "lv_kiosk/notice.rs"]
+mod notice;
 
 use clap::Parser;
 use iced::widget::{
-    button, column, container, image, mouse_area, operation, rich_text, row, scrollable, span,
-    text, Column, Id, Row,
+    button, column, container, image, mouse_area, operation, progress_bar, rich_text, row,
+    scrollable, span, text, Column, Id, Row,
 };
-use iced::{time, window, Element, Length, Size, Subscription, Task, Theme};
+use iced::{time, window, Color, Element, Length, Size, Subscription, Task, Theme};
 use lv_mdb_tools::kiosk::{
     ArmMode, Catalog, KioskEngine, MachineSelection, PaymentKind, PaymentPolicy, Product,
     PromoCode, SelectionOutcome, SlotHealth, SlotId, StateStore, TransactionId, TransactionStatus,
@@ -15,6 +17,7 @@ use lv_mdb_tools::{
     ItemNumber, Level1Amount, MdbConfig, SessionEndReason, VendDecisionError, VendId,
 };
 use mdb::{ControllerEvent, DecisionFailure, MdbController};
+use notice::{Notice, NoticeBanner, NoticeSeverity};
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -24,6 +27,10 @@ const LIGHTNING_TIMEOUT: Duration = Duration::from_secs(45);
 const RATE_LIMIT_RESET: Duration = Duration::from_secs(60);
 const RATE_LIMIT_DELAY: Duration = Duration::from_secs(3);
 const ADMIN_LOCKOUT: Duration = Duration::from_secs(30);
+const LOGIC_TICK_INTERVAL: Duration = Duration::from_secs(1);
+const TRANSIENT_NOTICE_DURATION: Duration = Duration::from_secs(6);
+const PENDING_PROMO_TIMEOUT: Duration = Duration::from_secs(40);
+const KEYPAD_BUTTON_HEIGHT: f32 = 80.0;
 const MDB_APPLICATION_RESPONSE_TIME: Duration = Duration::from_secs(46);
 const MDB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -125,15 +132,14 @@ impl ApplicationState {
     fn subscription(&self) -> Subscription<Message> {
         match self {
             Self::Running(app) => {
-                let clock = time::every(Duration::from_secs(1)).map(Message::Tick);
+                let mut subscriptions = vec![time::every(LOGIC_TICK_INTERVAL).map(Message::Tick)];
                 if app.is_hardware() {
-                    Subscription::batch([
-                        clock,
-                        time::every(MDB_POLL_INTERVAL).map(|_| Message::PollMdb),
-                    ])
-                } else {
-                    clock
+                    subscriptions.push(time::every(MDB_POLL_INTERVAL).map(|_| Message::PollMdb));
                 }
+                if app.animations_active() {
+                    subscriptions.push(window::frames().map(Message::AnimationFrame));
+                }
+                Subscription::batch(subscriptions)
             }
             Self::Failed(_) => Subscription::none(),
         }
@@ -150,7 +156,7 @@ struct KioskApp {
     page: Page,
     promo_input: String,
     admin_input: String,
-    notice: Option<String>,
+    notice: NoticeBanner,
     now: Instant,
     last_customer_activity: Instant,
     invalid_code_attempts: u32,
@@ -214,9 +220,19 @@ struct MdbVendRequest {
 }
 
 #[derive(Clone)]
+enum PromoEntryContext {
+    Browsing,
+    PendingSelection {
+        request: Option<MdbVendRequest>,
+        selection: MachineSelection,
+        expires_at: Instant,
+    },
+}
+
+#[derive(Clone)]
 enum Page {
     Ready,
-    PromoEntry,
+    PromoEntry(PromoEntryContext),
     Promo,
     Lightning {
         transaction_id: TransactionId,
@@ -227,7 +243,7 @@ enum Page {
     Dispensing {
         transaction_id: TransactionId,
         selection: MachineSelection,
-        payment: PaymentKind,
+        started: Instant,
     },
     Result {
         title: String,
@@ -255,6 +271,7 @@ enum SimulatedVendResult {
 #[derive(Debug, Clone)]
 enum Message {
     Tick(Instant),
+    AnimationFrame(Instant),
     PollMdb,
     OpenPromo,
     PromoDigit(char),
@@ -330,10 +347,14 @@ impl KioskApp {
             page: Page::Ready,
             promo_input: String::new(),
             admin_input: String::new(),
-            notice: args.seed_demo.then(|| {
-                "Demo data loaded: codes 123456 and 654321; all slots stocked with 3 items."
-                    .to_owned()
-            }),
+            notice: NoticeBanner::new(args.seed_demo.then(|| {
+                Notice::transient(
+                    "Demo data loaded: codes 123456 and 654321; all slots stocked with 3 items.",
+                    NoticeSeverity::Info,
+                    now,
+                    TRANSIENT_NOTICE_DURATION,
+                )
+            })),
             now,
             last_customer_activity: now,
             invalid_code_attempts: 0,
@@ -347,53 +368,55 @@ impl KioskApp {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.now = Instant::now();
         if let Some(task) = self.update_catalog_drag(&message) {
             return task;
         }
 
         match message {
             Message::Tick(now) => self.tick(now),
+            Message::AnimationFrame(now) => self.animate_frame(now),
             Message::PollMdb => self.poll_mdb(),
             Message::OpenPromo => {
                 self.promo_input.clear();
-                self.notice = None;
-                self.page = Page::PromoEntry;
+                self.notice.clear();
+                self.page = Page::PromoEntry(PromoEntryContext::Browsing);
                 self.record_customer_activity();
             }
             Message::PromoDigit(digit) => {
                 if self.promo_input.len() < 6 {
                     self.promo_input.push(digit);
-                    self.notice = None;
+                    self.notice.clear();
                     self.record_customer_activity();
                 }
             }
             Message::PromoBackspace => {
                 self.promo_input.pop();
-                self.notice = None;
+                self.notice.clear();
                 self.record_customer_activity();
             }
             Message::SubmitPromo => self.submit_promo_code(),
-            Message::Done => self.finish_customer_session(),
+            Message::Done => self.finish_customer_session(false),
             Message::OpenAdmin => {
                 self.admin_input.clear();
-                self.notice = None;
+                self.notice.clear();
                 self.page = Page::AdminPin;
             }
             Message::AdminDigit(digit) => {
                 if self.admin_input.len() < 12 {
                     self.admin_input.push(digit);
-                    self.notice = None;
+                    self.notice.clear();
                 }
             }
             Message::AdminBackspace => {
                 self.admin_input.pop();
-                self.notice = None;
+                self.notice.clear();
             }
             Message::SubmitAdmin => self.submit_admin_pin(),
             Message::CloseAdmin => {
                 self.engine.disarm();
                 self.page = Page::Ready;
-                self.notice = None;
+                self.notice.clear();
             }
             Message::MachineSelected(slot) => self.machine_selected(&slot, None),
             Message::LightningAccepted(id) => self.lightning_accepted(id),
@@ -405,38 +428,32 @@ impl KioskApp {
                     Destination::Promo => Page::Promo,
                     Destination::Admin => Page::Admin,
                 };
-                self.notice = None;
+                self.notice.clear();
                 self.record_customer_activity();
             }
             Message::ArmFreeVend => {
                 self.engine.arm_free_vend();
-                self.notice = Some(
-                    "Free vend armed for the next configured, available selection.".to_owned(),
+                self.show_transient_notice(
+                    "Free vend armed for the next configured, available selection.",
+                    NoticeSeverity::Info,
                 );
             }
             Message::Disarm => {
                 self.engine.disarm();
-                self.notice = Some("Vend authorization disarmed.".to_owned());
+                self.show_transient_notice("Vend authorization disarmed.", NoticeSeverity::Info);
             }
             Message::ArmMaintenance(slot) => {
                 if let Err(error) = self.engine.arm_maintenance_test(slot.clone()) {
-                    self.notice = Some(error.to_string());
+                    self.show_transient_notice(error.to_string(), NoticeSeverity::Warning);
                 } else {
-                    self.notice = Some(format!(
-                        "Maintenance test armed. Enter {slot} on the vending machine."
-                    ));
+                    self.show_transient_notice(
+                        format!("Maintenance test armed. Enter {slot} on the vending machine."),
+                        NoticeSeverity::Info,
+                    );
                 }
             }
             Message::InventoryChange(slot, change) => self.change_inventory(slot, change),
-            Message::MarkSlotResolved(slot) => {
-                match self.engine.set_slot_health(slot, SlotHealth::Ready) {
-                    Ok(()) => {
-                        self.notice = Some("Slot marked ready.".to_owned());
-                        self.persist();
-                    }
-                    Err(error) => self.notice = Some(error.to_string()),
-                }
-            }
+            Message::MarkSlotResolved(slot) => self.mark_slot_resolved(slot),
             Message::ResolveUncertain(id, dispensed) => {
                 self.resolve_uncertain(id, dispensed);
             }
@@ -476,6 +493,10 @@ impl KioskApp {
         matches!(self.backend, Backend::Hardware(_))
     }
 
+    fn animations_active(&self) -> bool {
+        self.notice.is_animating() || matches!(&self.page, Page::Dispensing { .. })
+    }
+
     fn poll_mdb(&mut self) {
         let mut events = Vec::new();
         if let Backend::Hardware(controller) = &mut self.backend {
@@ -491,13 +512,7 @@ impl KioskApp {
     fn handle_mdb_event(&mut self, event: ControllerEvent) {
         match event {
             ControllerEvent::Connecting => self.machine_status = MachineStatus::Connecting,
-            ControllerEvent::SessionReady => {
-                let reconnected = matches!(self.machine_status, MachineStatus::Unavailable(_));
-                self.machine_status = MachineStatus::Ready;
-                if reconnected {
-                    self.notice = Some("Vending machine reconnected and ready.".to_owned());
-                }
-            }
+            ControllerEvent::SessionReady => self.mdb_session_ready(),
             ControllerEvent::VendRequested {
                 vend_id,
                 item,
@@ -556,11 +571,7 @@ impl KioskApp {
                 if let Some(item) = reported_item {
                     eprintln!("MDB reported successful item {item}");
                 }
-                self.finish_mdb_vend(
-                    vend_id,
-                    SimulatedVendResult::Success,
-                    "The vending machine reported a successful dispense.",
-                );
+                self.finish_mdb_vend(vend_id, SimulatedVendResult::Success, "");
             }
             ControllerEvent::VendFailed { vend_id } => self.finish_mdb_vend(
                 vend_id,
@@ -583,17 +594,101 @@ impl KioskApp {
                             "The MDB connection was lost before authorization.",
                         );
                     }
+                } else if let Some(vend_id) = self.pending_promo_vend_id() {
+                    self.clear_pending_promo_vend(
+                        vend_id,
+                        "The MDB connection was lost before the code could be entered.",
+                    );
                 }
             }
-            ControllerEvent::Fault(error) => self.notice = Some(format!("MDB warning: {error}")),
+            ControllerEvent::Fault(error) => self.mdb_fault(&error),
         }
     }
 
-    fn mdb_vend_requested(&mut self, request: MdbVendRequest, item: ItemNumber) {
-        if self.active_mdb_vend.is_some() {
+    fn mdb_session_ready(&mut self) {
+        let reconnected = matches!(self.machine_status, MachineStatus::Unavailable(_));
+        self.machine_status = MachineStatus::Ready;
+        if reconnected {
+            self.show_transient_notice(
+                "Vending machine reconnected and ready.",
+                NoticeSeverity::Info,
+            );
+        }
+    }
+
+    fn mdb_fault(&mut self, error: &str) {
+        self.show_persistent_notice(format!("MDB warning: {error}"), NoticeSeverity::Error);
+    }
+
+    fn has_pending_promo_selection(&self) -> bool {
+        matches!(
+            &self.page,
+            Page::PromoEntry(PromoEntryContext::PendingSelection { .. })
+        )
+    }
+
+    fn pending_promo_vend_id(&self) -> Option<VendId> {
+        match &self.page {
+            Page::PromoEntry(PromoEntryContext::PendingSelection {
+                request: Some(request),
+                ..
+            }) => Some(request.vend_id),
+            _ => None,
+        }
+    }
+
+    fn take_pending_promo_selection(
+        &mut self,
+    ) -> Option<(Option<MdbVendRequest>, MachineSelection)> {
+        let pending = match &self.page {
+            Page::PromoEntry(PromoEntryContext::PendingSelection {
+                request, selection, ..
+            }) => Some((*request, selection.clone())),
+            _ => None,
+        };
+        if pending.is_some() {
+            self.page = Page::Ready;
+        }
+        pending
+    }
+
+    fn clear_pending_promo_vend(&mut self, vend_id: VendId, notice: &str) -> bool {
+        if self.pending_promo_vend_id() != Some(vend_id) {
+            return false;
+        }
+        self.take_pending_promo_selection();
+        self.promo_input.clear();
+        self.show_transient_notice(notice, NoticeSeverity::Warning);
+        true
+    }
+
+    fn expire_pending_promo_selection(&mut self) -> bool {
+        let expired = matches!(
+            &self.page,
+            Page::PromoEntry(PromoEntryContext::PendingSelection { expires_at, .. })
+                if self.now >= *expires_at
+        );
+        if !expired {
+            return false;
+        }
+        if let Some((Some(request), _)) = self.take_pending_promo_selection() {
             self.deny_mdb(request.vend_id);
-            self.notice =
-                Some("The machine requested another vend while one was active.".to_owned());
+        }
+        self.promo_input.clear();
+        self.show_transient_notice(
+            "That selection timed out. Enter it on the vending machine again to retry.",
+            NoticeSeverity::Warning,
+        );
+        true
+    }
+
+    fn mdb_vend_requested(&mut self, request: MdbVendRequest, item: ItemNumber) {
+        if self.active_mdb_vend.is_some() || self.has_pending_promo_selection() {
+            self.deny_mdb(request.vend_id);
+            self.show_persistent_notice(
+                "The machine requested another vend while one was active.",
+                NoticeSeverity::Error,
+            );
             return;
         }
         let [row, column] = item.bytes();
@@ -601,7 +696,10 @@ impl KioskApp {
             Ok(slot) => slot,
             Err(error) => {
                 self.deny_mdb(request.vend_id);
-                self.notice = Some(format!("Unsupported machine selection {item}: {error}"));
+                self.show_persistent_notice(
+                    format!("Unsupported machine selection {item}: {error}"),
+                    NoticeSeverity::Error,
+                );
                 return;
             }
         };
@@ -613,6 +711,13 @@ impl KioskApp {
     }
 
     fn mdb_session_ended(&mut self, reason: SessionEndReason) {
+        if let Some(vend_id) = self.pending_promo_vend_id() {
+            self.clear_pending_promo_vend(
+                vend_id,
+                &format!("The vending machine ended the selection ({reason:?})."),
+            );
+            return;
+        }
         let Some(active) = self.active_mdb_vend else {
             return;
         };
@@ -633,19 +738,50 @@ impl KioskApp {
     fn resolve_uncertain(&mut self, id: TransactionId, dispensed: bool) {
         match self.engine.resolve_uncertain(id, dispensed) {
             Ok(()) => {
-                self.notice = Some(if dispensed {
-                    "Transaction marked dispensed; inventory and entitlement updated.".to_owned()
+                let message = if dispensed {
+                    "Transaction marked dispensed; inventory and entitlement updated."
                 } else {
-                    "Transaction marked not dispensed; reservation released.".to_owned()
-                });
+                    "Transaction marked not dispensed; reservation released."
+                };
+                self.show_transient_notice(message, NoticeSeverity::Info);
                 self.persist();
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
         }
     }
 
     fn tick(&mut self, now: Instant) {
         self.now = now;
+        self.notice.expire(now);
+        if self.expire_pending_promo_selection() {
+            return;
+        }
+        if self
+            .next_code_attempt
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.next_code_attempt = None;
+            if matches!(&self.page, Page::PromoEntry(_)) {
+                self.show_transient_notice(
+                    "You can try another event code now.",
+                    NoticeSeverity::Info,
+                );
+            }
+        }
+        if self
+            .admin_locked_until
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.admin_locked_until = None;
+            if matches!(self.page, Page::AdminPin) {
+                self.show_transient_notice(
+                    "Admin access unlocked. Enter your PIN to try again.",
+                    NoticeSeverity::Info,
+                );
+            }
+        }
         if self
             .last_invalid_code
             .is_some_and(|last| now.saturating_duration_since(last) >= RATE_LIMIT_RESET)
@@ -659,8 +795,7 @@ impl KioskApp {
             && !matches!(self.page, Page::Dispensing { .. })
             && now.saturating_duration_since(self.last_customer_activity) >= CUSTOMER_IDLE_TIMEOUT
         {
-            self.finish_customer_session();
-            self.notice = Some("Promo session ended after 20 seconds of inactivity.".to_owned());
+            self.finish_customer_session(true);
             return;
         }
 
@@ -682,10 +817,21 @@ impl KioskApp {
         }
     }
 
+    fn animate_frame(&mut self, now: Instant) {
+        self.now = now;
+        self.notice.expire(now);
+    }
+
     fn submit_promo_code(&mut self) {
         self.record_customer_activity();
+        if self.expire_pending_promo_selection() {
+            return;
+        }
         if self.next_code_attempt.is_some_and(|next| self.now < next) {
-            self.notice = Some("Please wait a moment before trying another code.".to_owned());
+            self.show_transient_notice(
+                "Please wait a moment before trying another code.",
+                NoticeSeverity::Warning,
+            );
             return;
         }
 
@@ -696,15 +842,33 @@ impl KioskApp {
             self.last_invalid_code = None;
             self.next_code_attempt = None;
             self.promo_input.clear();
-            self.notice = Some("Code accepted. Choose any included item.".to_owned());
-            self.page = Page::Promo;
+            if let Some((request, selection)) = self.take_pending_promo_selection() {
+                let slot = selection.slot().clone();
+                self.page = Page::Promo;
+                self.machine_selected(&slot, request);
+            } else {
+                self.show_transient_notice(
+                    "Code accepted. Choose any included item.",
+                    NoticeSeverity::Info,
+                );
+                self.page = Page::Promo;
+            }
         } else {
             self.invalid_code_attempts += 1;
             self.last_invalid_code = Some(self.now);
             if self.invalid_code_attempts >= 5 {
                 self.next_code_attempt = Some(self.now + RATE_LIMIT_DELAY);
+                self.show_transient_notice_for(
+                    "Too many invalid codes. Please wait before retrying.",
+                    NoticeSeverity::Warning,
+                    RATE_LIMIT_DELAY,
+                );
+            } else {
+                self.show_transient_notice(
+                    "That code was not recognized.",
+                    NoticeSeverity::Warning,
+                );
             }
-            self.notice = Some("That code was not recognized.".to_owned());
             self.promo_input.clear();
         }
     }
@@ -714,14 +878,17 @@ impl KioskApp {
             .admin_locked_until
             .is_some_and(|until| self.now < until)
         {
-            self.notice = Some("Admin access is temporarily locked.".to_owned());
+            self.show_transient_notice(
+                "Admin access is temporarily locked.",
+                NoticeSeverity::Warning,
+            );
             return;
         }
         if self.admin_input == self.admin_pin {
             self.invalid_admin_attempts = 0;
             self.admin_locked_until = None;
             self.admin_input.clear();
-            self.notice = None;
+            self.notice.clear();
             self.page = Page::Admin;
         } else {
             self.invalid_admin_attempts += 1;
@@ -729,27 +896,48 @@ impl KioskApp {
             if self.invalid_admin_attempts >= 5 {
                 self.invalid_admin_attempts = 0;
                 self.admin_locked_until = Some(self.now + ADMIN_LOCKOUT);
-                self.notice =
-                    Some("Too many attempts. Admin access locked for 30 seconds.".to_owned());
+                self.show_transient_notice_for(
+                    "Too many attempts. Admin access locked for 30 seconds.",
+                    NoticeSeverity::Warning,
+                    ADMIN_LOCKOUT,
+                );
             } else {
-                self.notice = Some("Incorrect admin PIN.".to_owned());
+                self.show_transient_notice("Incorrect admin PIN.", NoticeSeverity::Warning);
             }
         }
     }
 
-    fn finish_customer_session(&mut self) {
+    fn finish_customer_session(&mut self, timed_out: bool) {
+        if let Some((Some(request), _)) = self.take_pending_promo_selection() {
+            self.deny_mdb(request.vend_id);
+        }
         if let Err(error) = self.engine.end_customer_session() {
-            self.notice = Some(error.to_string());
+            self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
         } else {
-            self.persist();
+            let persisted = self.persist();
             self.page = Page::Ready;
             self.promo_input.clear();
+            if timed_out && persisted {
+                self.show_transient_notice(
+                    "Promo session ended after 20 seconds of inactivity.",
+                    NoticeSeverity::Info,
+                );
+            }
         }
     }
 
     fn machine_selected(&mut self, slot: &SlotId, mdb_request: Option<MdbVendRequest>) {
         self.record_customer_activity();
         match self.engine.machine_selected(slot) {
+            Ok(SelectionOutcome::PromoCodeRequired { selection }) => {
+                self.promo_input.clear();
+                self.notice.clear();
+                self.page = Page::PromoEntry(PromoEntryContext::PendingSelection {
+                    request: mdb_request,
+                    selection,
+                    expires_at: self.now + PENDING_PROMO_TIMEOUT,
+                });
+            }
             Ok(SelectionOutcome::LightningPaymentRequired {
                 transaction_id,
                 selection,
@@ -771,7 +959,7 @@ impl KioskApp {
                         approval_sent: false,
                     });
                 }
-                self.notice = None;
+                self.notice.clear();
                 self.page = Page::Lightning {
                     transaction_id,
                     selection,
@@ -800,11 +988,11 @@ impl KioskApp {
                         approval_sent: false,
                     });
                 }
-                self.notice = None;
+                self.notice.clear();
                 self.page = Page::Dispensing {
                     transaction_id,
                     selection,
-                    payment: payment.clone(),
+                    started: self.now,
                 };
                 if mdb_request.is_some() {
                     self.approve_active_mdb_vend(&payment);
@@ -814,13 +1002,13 @@ impl KioskApp {
                 if let Some(request) = mdb_request {
                     self.deny_mdb(request.vend_id);
                 }
-                self.notice = Some(message);
+                self.show_transient_notice(message, NoticeSeverity::Warning);
             }
             Err(error) => {
                 if let Some(request) = mdb_request {
                     self.deny_mdb(request.vend_id);
                 }
-                self.notice = Some(error.to_string());
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
             }
         }
     }
@@ -844,15 +1032,18 @@ impl KioskApp {
                 self.page = Page::Dispensing {
                     transaction_id,
                     selection,
-                    payment: payment.clone(),
+                    started: self.now,
                 };
-                self.notice = None;
+                self.notice.clear();
                 if self.is_hardware() {
                     self.approve_active_mdb_vend(&payment);
                 }
             }
-            Ok(_) => self.notice = Some("Unexpected Lightning transition.".to_owned()),
-            Err(error) => self.notice = Some(error.to_string()),
+            Ok(_) => self
+                .show_persistent_notice("Unexpected Lightning transition.", NoticeSeverity::Error),
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
         }
     }
 
@@ -863,7 +1054,7 @@ impl KioskApp {
     fn cancel_lightning_with_notice(&mut self, id: TransactionId, notice: &str) {
         match self.engine.cancel_lightning(id) {
             Ok(()) => {
-                self.persist();
+                let persisted = self.persist();
                 if let Some(active) = self
                     .active_mdb_vend
                     .filter(|active| active.transaction_id == id)
@@ -872,9 +1063,13 @@ impl KioskApp {
                     self.deny_mdb(active.vend_id);
                 }
                 self.page = Page::Ready;
-                self.notice = Some(notice.to_owned());
+                if persisted {
+                    self.show_transient_notice(notice, NoticeSeverity::Warning);
+                }
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
         }
     }
 
@@ -921,10 +1116,7 @@ impl KioskApp {
                     _ => Destination::Ready,
                 };
                 let (title, default_body) = match result {
-                    SimulatedVendResult::Success => (
-                        "Enjoy!",
-                        "The vending machine reported a successful dispense.",
-                    ),
+                    SimulatedVendResult::Success => ("Enjoy!", ""),
                     SimulatedVendResult::Failure => (
                         "Could not dispense",
                         "Nothing was claimed or charged. The slot now needs attention.",
@@ -944,7 +1136,9 @@ impl KioskApp {
                     destination,
                 };
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
         }
     }
 
@@ -960,6 +1154,9 @@ impl KioskApp {
     }
 
     fn cancel_mdb_transaction(&mut self, vend_id: VendId, notice: &str) {
+        if self.clear_pending_promo_vend(vend_id, notice) {
+            return;
+        }
         let Some(active) = self
             .active_mdb_vend
             .filter(|active| active.vend_id == vend_id)
@@ -976,19 +1173,26 @@ impl KioskApp {
             .map(|transaction| transaction.payment().clone());
         match self.engine.vend_cancelled(active.transaction_id) {
             Ok(()) => {
-                self.persist();
+                let persisted = self.persist();
                 self.page = payment
                     .as_ref()
                     .map_or(Page::Ready, Self::destination_page_for);
-                self.notice = Some(notice.to_owned());
+                if persisted {
+                    self.show_transient_notice(notice, NoticeSeverity::Warning);
+                }
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
         }
     }
 
     fn approve_active_mdb_vend(&mut self, payment: &PaymentKind) {
         let Some(active) = self.active_mdb_vend else {
-            self.notice = Some("The MDB selection is no longer active.".to_owned());
+            self.show_persistent_notice(
+                "The MDB selection is no longer active.",
+                NoticeSeverity::Error,
+            );
             return;
         };
         let amount = match approval_amount(payment) {
@@ -1037,6 +1241,18 @@ impl KioskApp {
         }
     }
 
+    fn mark_slot_resolved(&mut self, slot: SlotId) {
+        match self.engine.set_slot_health(slot, SlotHealth::Ready) {
+            Ok(()) => {
+                self.show_transient_notice("Slot marked ready.", NoticeSeverity::Info);
+                self.persist();
+            }
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
+        }
+    }
+
     fn change_inventory(&mut self, slot: SlotId, change: i32) {
         let current = self.engine.state().inventory(&slot);
         let quantity = if change.is_negative() {
@@ -1046,10 +1262,15 @@ impl KioskApp {
         };
         match self.engine.set_inventory(slot, quantity) {
             Ok(()) => {
-                self.notice = Some(format!("Inventory updated to {quantity}."));
+                self.show_transient_notice(
+                    format!("Inventory updated to {quantity}."),
+                    NoticeSeverity::Info,
+                );
                 self.persist();
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => {
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            }
         }
     }
 
@@ -1057,7 +1278,10 @@ impl KioskApp {
         match self.store.save(self.engine.state()) {
             Ok(()) => true,
             Err(error) => {
-                self.notice = Some(format!("Could not save kiosk state: {error}"));
+                self.show_persistent_notice(
+                    format!("Could not save kiosk state: {error}"),
+                    NoticeSeverity::Error,
+                );
                 false
             }
         }
@@ -1065,6 +1289,24 @@ impl KioskApp {
 
     fn record_customer_activity(&mut self) {
         self.last_customer_activity = self.now;
+    }
+
+    fn show_transient_notice(&mut self, message: impl Into<String>, severity: NoticeSeverity) {
+        self.show_transient_notice_for(message, severity, TRANSIENT_NOTICE_DURATION);
+    }
+
+    fn show_transient_notice_for(
+        &mut self,
+        message: impl Into<String>,
+        severity: NoticeSeverity,
+        duration: Duration,
+    ) {
+        self.notice
+            .show(Notice::transient(message, severity, self.now, duration));
+    }
+
+    fn show_persistent_notice(&mut self, message: impl Into<String>, severity: NoticeSeverity) {
+        self.notice.show(Notice::persistent(message, severity));
     }
 
     fn view(&self) -> Element<'_, Message> {
@@ -1076,7 +1318,7 @@ impl KioskApp {
         } else {
             match &self.page {
                 Page::Ready => self.view_ready(),
-                Page::PromoEntry => self.view_promo_entry(),
+                Page::PromoEntry(context) => self.view_promo_entry(context),
                 Page::Promo => self.view_promo(),
                 Page::Lightning {
                     transaction_id,
@@ -1087,8 +1329,9 @@ impl KioskApp {
                 Page::Dispensing {
                     transaction_id,
                     selection,
-                    payment,
-                } => self.view_dispensing(*transaction_id, selection, payment),
+                    started,
+                    ..
+                } => self.view_dispensing(*transaction_id, selection, *started),
                 Page::Result {
                     title,
                     body,
@@ -1161,31 +1404,88 @@ impl KioskApp {
         content.into()
     }
 
-    fn view_promo_entry(&self) -> Element<'_, Message> {
-        let locked = self.next_code_attempt.is_some_and(|next| self.now < next);
+    fn view_promo_entry<'a>(&'a self, context: &'a PromoEntryContext) -> Element<'a, Message> {
+        let rate_limit_seconds = seconds_until(self.next_code_attempt, self.now);
         let keypad = numeric_keypad(
             Message::PromoDigit,
             Message::PromoBackspace,
             Message::SubmitPromo,
-            self.promo_input.len() == 6 && !locked,
+            self.promo_input.len() == 6 && rate_limit_seconds.is_none(),
+            rate_limit_seconds,
         );
-        column![
-            text("Enter event code").size(30),
-            text("Use the touchscreen keypad below."),
-            self.notice_view(),
-            container(text("●".repeat(self.promo_input.len())).size(34))
-                .height(70)
-                .width(Length::Fill)
-                .center(Length::Fill)
-                .style(container::rounded_box),
-            keypad,
-            button("Cancel")
-                .width(Length::Fill)
-                .style(button::secondary)
-                .on_press(Message::Done)
-        ]
-        .spacing(16)
-        .into()
+        let prompt: Option<Element<'_, Message>> = match context {
+            PromoEntryContext::Browsing => None,
+            PromoEntryContext::PendingSelection {
+                selection,
+                expires_at,
+                ..
+            } => {
+                let seconds = seconds_until(Some(*expires_at), self.now).unwrap_or(0);
+                let remaining = expires_at.saturating_duration_since(self.now).as_secs_f32()
+                    / PENDING_PROMO_TIMEOUT.as_secs_f32();
+                let product_visual: Element<'_, Message> = self
+                    .engine
+                    .catalog()
+                    .product(selection.product())
+                    .map_or_else(
+                        || container("").width(100).height(95).into(),
+                        |product| {
+                            container(Self::product_image(product))
+                                .width(100)
+                                .height(95)
+                                .into()
+                        },
+                    );
+                Some(
+                    column![
+                        row![
+                            product_visual,
+                            column![
+                                text(selection.product_name()).size(21),
+                                text(format!("Selection {}", selection.slot())).size(15),
+                                text(format!("{seconds}s remaining")).size(16),
+                                progress_bar(0.0..=1.0, remaining.clamp(0.0, 1.0)).girth(7)
+                            ]
+                            .spacing(7)
+                            .width(Length::Fill)
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Alignment::Center),
+                        text("Enter your event code to vend this item immediately.").size(15)
+                    ]
+                    .spacing(10)
+                    .into(),
+                )
+            }
+        };
+        let mut layout = Column::new()
+            .push(
+                row![
+                    text("Enter event code").size(30).width(Length::Fill),
+                    button(container(text("←").size(30)).center(Length::Fill))
+                        .width(58)
+                        .height(48)
+                        .padding(0)
+                        .style(button::secondary)
+                        .on_press(Message::Done)
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .spacing(16);
+        if let Some(prompt) = prompt {
+            layout = layout.push(prompt);
+        }
+        layout
+            .push(self.notice_view())
+            .push(
+                container(text("●".repeat(self.promo_input.len())).size(34))
+                    .height(70)
+                    .width(Length::Fill)
+                    .center(Length::Fill)
+                    .style(container::rounded_box),
+            )
+            .push(keypad)
+            .into()
     }
 
     fn view_promo(&self) -> Element<'_, Message> {
@@ -1250,9 +1550,7 @@ impl KioskApp {
                     text(format!("Code {code} · signs out in {idle}s"))
                 ]
                 .width(Length::Fill),
-                button("Done")
-                    .style(button::secondary)
-                    .on_press(Message::Done)
+                header_action_button("Done", Message::Done)
             ]
             .align_y(iced::Alignment::Center),
             self.notice_view(),
@@ -1319,8 +1617,11 @@ impl KioskApp {
         &self,
         transaction_id: TransactionId,
         selection: &MachineSelection,
-        payment: &PaymentKind,
+        started: Instant,
     ) -> Element<'_, Message> {
+        let angle =
+            self.now.saturating_duration_since(started).as_secs_f32() * std::f32::consts::TAU / 1.1;
+        let spinner = circular_spinner(angle);
         let result_controls: Element<'_, Message> = if self.is_hardware() {
             container(text("Waiting for the vending machine to report the result…").size(18))
                 .padding(16)
@@ -1361,14 +1662,9 @@ impl KioskApp {
             .into()
         };
         column![
+            spinner,
             text("Dispensing…").size(38),
             text(selection.product_name().to_owned()).size(26),
-            text(format!(
-                "Selection {} · {}",
-                selection.slot(),
-                payment.name()
-            ))
-            .size(18),
             result_controls
         ]
         .align_x(iced::Alignment::Center)
@@ -1377,26 +1673,37 @@ impl KioskApp {
     }
 
     fn view_result(title: &str, body: &str, destination: Destination) -> Element<'static, Message> {
-        column![
-            text(title.to_owned()).size(40),
-            text(body.to_owned()).size(20),
-            button("Continue")
-                .padding(16)
-                .width(Length::Fill)
-                .style(button::primary)
-                .on_press(Message::DismissResult(destination))
-        ]
-        .align_x(iced::Alignment::Center)
-        .spacing(28)
-        .into()
+        let mut content = Column::new()
+            .push(text(title.to_owned()).size(40))
+            .align_x(iced::Alignment::Center)
+            .spacing(28);
+        if !body.is_empty() {
+            content = content.push(text(body.to_owned()).size(20));
+        }
+        content
+            .push(
+                button("Continue")
+                    .padding(16)
+                    .width(Length::Fill)
+                    .style(button::primary)
+                    .on_press(Message::DismissResult(destination)),
+            )
+            .into()
     }
 
     fn view_admin_pin(&self) -> Element<'_, Message> {
-        let locked = self
-            .admin_locked_until
-            .is_some_and(|until| self.now < until);
+        let rate_limit_seconds = seconds_until(self.admin_locked_until, self.now);
         column![
-            text("Administrator access").size(30),
+            row![
+                text("Administrator access").size(30).width(Length::Fill),
+                button(container(text("←").size(30)).center(Length::Fill))
+                    .width(58)
+                    .height(48)
+                    .padding(0)
+                    .style(button::secondary)
+                    .on_press(Message::CloseAdmin)
+            ]
+            .align_y(iced::Alignment::Center),
             self.notice_view(),
             container(text("●".repeat(self.admin_input.len())).size(34))
                 .height(70)
@@ -1407,12 +1714,9 @@ impl KioskApp {
                 Message::AdminDigit,
                 Message::AdminBackspace,
                 Message::SubmitAdmin,
-                !self.admin_input.is_empty() && !locked,
-            ),
-            button("Cancel")
-                .width(Length::Fill)
-                .style(button::secondary)
-                .on_press(Message::CloseAdmin)
+                !self.admin_input.is_empty() && rate_limit_seconds.is_none(),
+                rate_limit_seconds,
+            )
         ]
         .spacing(16)
         .into()
@@ -1438,7 +1742,7 @@ impl KioskApp {
         let body = column![
             row![
                 text("Admin").size(30).width(Length::Fill),
-                button("Exit").on_press(Message::CloseAdmin)
+                header_action_button("Exit", Message::CloseAdmin)
             ],
             self.notice_view(),
             text(arm_status),
@@ -1719,13 +2023,21 @@ impl KioskApp {
     }
 
     fn notice_view(&self) -> Element<'_, Message> {
-        self.notice.as_ref().map_or_else(
+        self.notice.current().map_or_else(
             || container("").height(0).into(),
             |notice| {
-                container(text(notice).size(15))
+                let mut content = column![text(notice.message()).size(15)].spacing(7);
+                if let Some(remaining) = notice.remaining_fraction(self.now) {
+                    content = content.push(progress_bar(0.0..=1.0, remaining).girth(5));
+                }
+                container(content)
                     .padding(8)
                     .width(Length::Fill)
-                    .style(container::warning)
+                    .style(match notice.severity() {
+                        NoticeSeverity::Info => container::secondary,
+                        NoticeSeverity::Warning => container::warning,
+                        NoticeSeverity::Error => container::danger,
+                    })
                     .into()
             },
         )
@@ -1737,15 +2049,17 @@ fn numeric_keypad(
     backspace: Message,
     submit: Message,
     submit_enabled: bool,
+    rate_limit_seconds: Option<u64>,
 ) -> Element<'static, Message> {
     let mut keypad = Column::new().spacing(8);
     for digits in [['1', '2', '3'], ['4', '5', '6'], ['7', '8', '9']] {
         let mut digit_row = Row::new().spacing(8);
         for digit in digits {
             digit_row = digit_row.push(
-                button(text(digit).size(26))
-                    .height(64)
+                button(keypad_button_content(digit.to_string()))
+                    .height(KEYPAD_BUTTON_HEIGHT)
                     .width(Length::FillPortion(1))
+                    .padding(0)
                     .on_press(digit_message(digit)),
             );
         }
@@ -1753,30 +2067,86 @@ fn numeric_keypad(
     }
     keypad = keypad.push(
         row![
-            button("⌫")
-                .height(64)
+            button(keypad_button_content("⌫".to_owned()))
+                .height(KEYPAD_BUTTON_HEIGHT)
                 .width(Length::FillPortion(1))
+                .padding(0)
                 .on_press(backspace),
-            button(text('0').size(26))
-                .height(64)
+            button(keypad_button_content("0".to_owned()))
+                .height(KEYPAD_BUTTON_HEIGHT)
                 .width(Length::FillPortion(1))
+                .padding(0)
                 .on_press(digit_message('0')),
             if submit_enabled {
-                button("Enter")
-                    .height(64)
+                button(keypad_button_content("Enter".to_owned()))
+                    .height(KEYPAD_BUTTON_HEIGHT)
                     .width(Length::FillPortion(1))
+                    .padding(0)
                     .style(button::success)
                     .on_press(submit)
             } else {
-                button("Enter")
-                    .height(64)
-                    .width(Length::FillPortion(1))
-                    .style(button::secondary)
+                button(keypad_button_content(rate_limit_seconds.map_or_else(
+                    || "Enter".to_owned(),
+                    |seconds| format!("Enter ({seconds}s)"),
+                )))
+                .height(KEYPAD_BUTTON_HEIGHT)
+                .width(Length::FillPortion(1))
+                .padding(0)
+                .style(button::secondary)
             }
         ]
         .spacing(8),
     );
     keypad.into()
+}
+
+fn header_action_button(label: &'static str, message: Message) -> Element<'static, Message> {
+    button(container(text(label).size(20)).center(Length::Fill))
+        .width(116)
+        .height(60)
+        .padding(0)
+        .style(button::secondary)
+        .on_press(message)
+        .into()
+}
+
+fn keypad_button_content(label: String) -> Element<'static, Message> {
+    container(text(label).size(26)).center(Length::Fill).into()
+}
+
+fn circular_spinner(angle: f32) -> Element<'static, Message> {
+    let phase = angle.rem_euclid(std::f32::consts::TAU) / std::f32::consts::TAU * 8.0;
+    let dot = |position: f32| -> Element<'static, Message> {
+        let trail = (phase - position).rem_euclid(8.0);
+        let alpha = trail.mul_add(-0.1, 1.0);
+        container(
+            text("●")
+                .size(30)
+                .color(Color::from_rgb8(0x7C, 0x86, 0xFF).scale_alpha(alpha)),
+        )
+        .center_x(32)
+        .center_y(32)
+        .into()
+    };
+    let empty = || -> Element<'static, Message> { container("").width(32).height(32).into() };
+
+    container(
+        column![
+            row![dot(7.0), dot(0.0), dot(1.0)].spacing(3),
+            row![dot(6.0), empty(), dot(2.0)].spacing(3),
+            row![dot(5.0), dot(4.0), dot(3.0)].spacing(3)
+        ]
+        .spacing(3),
+    )
+    .center_x(118)
+    .center_y(118)
+    .into()
+}
+
+fn seconds_until(deadline: Option<Instant>, now: Instant) -> Option<u64> {
+    let deadline = deadline.filter(|deadline| *deadline > now)?;
+    let remaining = deadline.duration_since(now);
+    Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
 }
 
 fn dollars(cents: u32) -> String {
@@ -1835,5 +2205,24 @@ mod tests {
 
         drag.release();
         assert_eq!(drag.move_to(150.0), None);
+    }
+
+    #[test]
+    fn rate_limit_countdown_rounds_up_and_expires() {
+        let now = Instant::now();
+        assert_eq!(
+            seconds_until(Some(now + Duration::from_secs(3)), now),
+            Some(3)
+        );
+        assert_eq!(
+            seconds_until(Some(now + Duration::from_millis(2_001)), now),
+            Some(3)
+        );
+        assert_eq!(seconds_until(Some(now), now), None);
+        assert_eq!(
+            seconds_until(Some(now.checked_sub(Duration::from_secs(1)).unwrap()), now),
+            None
+        );
+        assert_eq!(seconds_until(None, now), None);
     }
 }

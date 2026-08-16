@@ -356,6 +356,9 @@ impl MachineSelection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionOutcome {
+    PromoCodeRequired {
+        selection: MachineSelection,
+    },
     LightningPaymentRequired {
         transaction_id: TransactionId,
         selection: MachineSelection,
@@ -549,9 +552,7 @@ impl KioskEngine {
                 }
                 self.approve(selection, PaymentKind::Promo { code })
             }
-            (None, PaymentPolicy::Promo) => Ok(SelectionOutcome::Denied(
-                "Enter your event code on the touchscreen first.".to_owned(),
-            )),
+            (None, PaymentPolicy::Promo) => Ok(SelectionOutcome::PromoCodeRequired { selection }),
             (None, PaymentPolicy::Lightning { price_cents }) => {
                 let id = self.create_transaction(
                     &selection,
@@ -885,8 +886,27 @@ mod tests {
         match outcome {
             SelectionOutcome::VendApproved { transaction_id, .. }
             | SelectionOutcome::LightningPaymentRequired { transaction_id, .. } => transaction_id,
+            SelectionOutcome::PromoCodeRequired { selection } => {
+                panic!("promo code required for {}", selection.slot())
+            }
             SelectionOutcome::Denied(message) => panic!("selection denied: {message}"),
         }
+    }
+
+    #[test]
+    fn promo_selection_without_a_code_requests_authentication_without_a_transaction() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("A2").unwrap();
+
+        let outcome = engine.machine_selected(&slot).unwrap();
+
+        assert!(matches!(
+            outcome,
+            SelectionOutcome::PromoCodeRequired { selection }
+                if selection.slot() == &slot && selection.product_name() == "Sparkling Water"
+        ));
+        assert_eq!(engine.active_transaction, None);
+        assert!(engine.state().transactions().is_empty());
     }
 
     #[test]
