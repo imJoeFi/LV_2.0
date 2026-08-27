@@ -1,4 +1,7 @@
-use super::{Catalog, PaymentPolicy, ProductId, SlotId};
+use super::{
+    AssistanceReason, AssistanceResolution, Catalog, LightningInvoice, LightningPurchase,
+    LightningPurchaseState, Msats, PaymentPolicy, ProductId, PurchaseId, SlotId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -142,26 +145,12 @@ impl CodeAccount {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TransactionId(u64);
-
-impl TransactionId {
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for TransactionId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+pub type TransactionId = PurchaseId;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaymentKind {
     Promo { code: PromoCode },
-    Lightning { price_cents: u32 },
+    Lightning { price: Msats },
     FreeVend,
     MaintenanceTest,
 }
@@ -184,6 +173,8 @@ pub enum TransactionStatus {
     Succeeded,
     Failed,
     Cancelled,
+    Expired,
+    AssistanceRequired,
     Uncertain,
     ResolvedDispensed,
     ResolvedNotDispensed,
@@ -242,7 +233,7 @@ pub struct PersistentState {
     health: BTreeMap<SlotId, SlotHealth>,
     codes: BTreeMap<PromoCode, CodeAccount>,
     transactions: Vec<Transaction>,
-    next_transaction_id: u64,
+    lightning_purchases: BTreeMap<PurchaseId, LightningPurchase>,
 }
 
 impl PersistentState {
@@ -283,6 +274,31 @@ impl PersistentState {
         &self.transactions
     }
 
+    pub fn lightning_purchases(&self) -> impl Iterator<Item = &LightningPurchase> {
+        self.lightning_purchases.values()
+    }
+
+    pub fn lightning_purchase(&self, id: PurchaseId) -> Option<&LightningPurchase> {
+        self.lightning_purchases.get(&id)
+    }
+
+    pub fn reserved_inventory(&self, slot: &SlotId) -> u32 {
+        u32::try_from(
+            self.lightning_purchases
+                .values()
+                .filter(|purchase| {
+                    purchase.slot == *slot && purchase.state.holds_inventory_reservation()
+                })
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    pub fn available_inventory(&self, slot: &SlotId) -> u32 {
+        self.inventory(slot)
+            .saturating_sub(self.reserved_inventory(slot))
+    }
+
     fn transaction(&self, id: TransactionId) -> Result<&Transaction, KioskError> {
         self.transactions
             .iter()
@@ -300,6 +316,40 @@ impl PersistentState {
     pub fn recover_after_restart(&mut self) -> bool {
         let mut changed = false;
         let mut needs_attention = Vec::new();
+        let recovered_at = unix_millis_now();
+        for purchase in self.lightning_purchases.values_mut() {
+            purchase.state = match &purchase.state {
+                LightningPurchaseState::InventoryReserved => {
+                    changed = true;
+                    LightningPurchaseState::CancelledBeforeInvoice {
+                        cancelled_at_unix_millis: recovered_at,
+                    }
+                }
+                LightningPurchaseState::InvoiceCreating { .. }
+                | LightningPurchaseState::AbandonedCreating { .. } => {
+                    changed = true;
+                    LightningPurchaseState::InvoiceCreationFailed {
+                        failed_at_unix_millis: recovered_at,
+                        message: "invoice creation was interrupted by a restart".to_owned(),
+                    }
+                }
+                LightningPurchaseState::InvoiceDisplayed { invoice } => {
+                    changed = true;
+                    LightningPurchaseState::AbandonedAwaitingFinal {
+                        invoice: invoice.clone(),
+                    }
+                }
+                LightningPurchaseState::AwaitingVend { invoice, .. } => {
+                    changed = true;
+                    needs_attention.push(purchase.slot.clone());
+                    LightningPurchaseState::VendUncertain {
+                        invoice: invoice.clone(),
+                        reference: format!("purchase {} recovered during vend", purchase.id),
+                    }
+                }
+                state => state.clone(),
+            };
+        }
         for transaction in &mut self.transactions {
             match transaction.status {
                 TransactionStatus::AwaitingPayment => {
@@ -362,7 +412,7 @@ pub enum SelectionOutcome {
     LightningPaymentRequired {
         transaction_id: TransactionId,
         selection: MachineSelection,
-        price_cents: u32,
+        price: Msats,
     },
     VendApproved {
         transaction_id: TransactionId,
@@ -429,10 +479,15 @@ impl KioskEngine {
 
     pub fn end_customer_session(&mut self) -> Result<(), KioskError> {
         if let Some(id) = self.active_transaction {
-            let status = self.state.transaction(id)?.status;
+            let transaction = self.state.transaction(id)?.clone();
+            let status = transaction.status;
             if status == TransactionStatus::AwaitingPayment {
-                self.state.transaction_mut(id)?.status = TransactionStatus::Cancelled;
-                self.active_transaction = None;
+                if matches!(transaction.payment, PaymentKind::Lightning { .. }) {
+                    self.cancel_lightning(id)?;
+                } else {
+                    self.state.transaction_mut(id)?.status = TransactionStatus::Cancelled;
+                    self.active_transaction = None;
+                }
             }
         }
         self.active_code = None;
@@ -553,17 +608,28 @@ impl KioskEngine {
                 self.approve(selection, PaymentKind::Promo { code })
             }
             (None, PaymentPolicy::Promo) => Ok(SelectionOutcome::PromoCodeRequired { selection }),
-            (None, PaymentPolicy::Lightning { price_cents }) => {
+            (None, PaymentPolicy::Lightning { price }) => {
                 let id = self.create_transaction(
                     &selection,
-                    PaymentKind::Lightning { price_cents },
+                    PaymentKind::Lightning { price },
                     TransactionStatus::AwaitingPayment,
+                );
+                self.state.lightning_purchases.insert(
+                    id,
+                    LightningPurchase {
+                        id,
+                        slot: selection.slot.clone(),
+                        product: selection.product.clone(),
+                        amount: price,
+                        created_at_unix_millis: unix_millis_now(),
+                        state: LightningPurchaseState::InventoryReserved,
+                    },
                 );
                 self.active_transaction = Some(id);
                 Ok(SelectionOutcome::LightningPaymentRequired {
                     transaction_id: id,
                     selection,
-                    price_cents,
+                    price,
                 })
             }
         }
@@ -591,13 +657,89 @@ impl KioskEngine {
         })
     }
 
+    pub fn begin_lightning_invoice(
+        &mut self,
+        id: TransactionId,
+        latest_expiration_unix_seconds: u64,
+    ) -> Result<(), KioskError> {
+        self.require_active_lightning(id)?;
+        let purchase = self.lightning_purchase_mut(id)?;
+        if purchase.state != LightningPurchaseState::InventoryReserved {
+            return Err(KioskError::InvalidTransactionState(id));
+        }
+        purchase.state = LightningPurchaseState::InvoiceCreating {
+            latest_expiration_unix_seconds,
+        };
+        Ok(())
+    }
+
+    /// Records an invoice returned by the asynchronous payment provider.
+    ///
+    /// If the customer left while the request was in flight, the invoice is
+    /// durably tracked as abandoned and can never authorize a vend.
+    pub fn lightning_invoice_created(
+        &mut self,
+        id: TransactionId,
+        invoice: LightningInvoice,
+    ) -> Result<(), KioskError> {
+        let purchase = self.lightning_purchase_mut(id)?;
+        purchase.state = match purchase.state {
+            LightningPurchaseState::InvoiceCreating { .. } => {
+                LightningPurchaseState::InvoiceDisplayed { invoice }
+            }
+            LightningPurchaseState::AbandonedCreating { .. } => {
+                LightningPurchaseState::AbandonedAwaitingFinal { invoice }
+            }
+            _ => return Err(KioskError::InvalidTransactionState(id)),
+        };
+        Ok(())
+    }
+
+    pub fn lightning_invoice_creation_failed(
+        &mut self,
+        id: TransactionId,
+        message: impl Into<String>,
+    ) -> Result<(), KioskError> {
+        let purchase = self.lightning_purchase_mut(id)?;
+        let was_abandoned = matches!(
+            purchase.state,
+            LightningPurchaseState::AbandonedCreating { .. }
+        );
+        if !matches!(
+            purchase.state,
+            LightningPurchaseState::InvoiceCreating { .. }
+                | LightningPurchaseState::AbandonedCreating { .. }
+        ) {
+            return Err(KioskError::InvalidTransactionState(id));
+        }
+        purchase.state = LightningPurchaseState::InvoiceCreationFailed {
+            failed_at_unix_millis: unix_millis_now(),
+            message: message.into(),
+        };
+        self.state.transaction_mut(id)?.status = if was_abandoned {
+            TransactionStatus::Cancelled
+        } else {
+            TransactionStatus::Failed
+        };
+        if self.active_transaction == Some(id) {
+            self.active_transaction = None;
+        }
+        Ok(())
+    }
+
     pub fn lightning_payment_accepted(
         &mut self,
         id: TransactionId,
     ) -> Result<SelectionOutcome, KioskError> {
-        if self.active_transaction != Some(id) {
-            return Err(KioskError::TransactionNotActive(id));
-        }
+        self.require_active_lightning(id)?;
+        let funded_at_unix_millis = unix_millis_now();
+        let invoice = {
+            let purchase = self.lightning_purchase_mut(id)?;
+            let LightningPurchaseState::InvoiceDisplayed { invoice } = &purchase.state else {
+                return Err(KioskError::InvalidTransactionState(id));
+            };
+            invoice.clone()
+        };
         let (slot, payment) = {
             let transaction = self.state.transaction_mut(id)?;
             if transaction.status != TransactionStatus::AwaitingPayment {
@@ -605,6 +747,10 @@ impl KioskEngine {
             }
             transaction.status = TransactionStatus::AwaitingVend;
             (transaction.slot.clone(), transaction.payment.clone())
+        };
+        self.lightning_purchase_mut(id)?.state = LightningPurchaseState::AwaitingVend {
+            invoice,
+            funded_at_unix_millis,
         };
         let selection = self.selection(&slot)?;
         Ok(SelectionOutcome::VendApproved {
@@ -615,15 +761,77 @@ impl KioskEngine {
     }
 
     pub fn cancel_lightning(&mut self, id: TransactionId) -> Result<(), KioskError> {
-        if self.active_transaction != Some(id) {
-            return Err(KioskError::TransactionNotActive(id));
-        }
+        self.require_active_lightning(id)?;
         let transaction = self.state.transaction_mut(id)?;
         if transaction.status != TransactionStatus::AwaitingPayment {
             return Err(KioskError::InvalidTransactionState(id));
         }
         transaction.status = TransactionStatus::Cancelled;
+        let cancelled_at_unix_millis = unix_millis_now();
+        let purchase = self.lightning_purchase_mut(id)?;
+        purchase.state = match &purchase.state {
+            LightningPurchaseState::InventoryReserved => {
+                LightningPurchaseState::CancelledBeforeInvoice {
+                    cancelled_at_unix_millis,
+                }
+            }
+            LightningPurchaseState::InvoiceCreating {
+                latest_expiration_unix_seconds,
+            } => LightningPurchaseState::AbandonedCreating {
+                latest_expiration_unix_seconds: *latest_expiration_unix_seconds,
+            },
+            LightningPurchaseState::InvoiceDisplayed { invoice } => {
+                LightningPurchaseState::AbandonedAwaitingFinal {
+                    invoice: invoice.clone(),
+                }
+            }
+            _ => return Err(KioskError::InvalidTransactionState(id)),
+        };
         self.active_transaction = None;
+        Ok(())
+    }
+
+    /// Records that an unpaid invoice reached its final expired state.
+    pub fn lightning_invoice_expired(
+        &mut self,
+        id: TransactionId,
+        expired_at_unix_millis: u64,
+    ) -> Result<(), KioskError> {
+        let purchase = self.lightning_purchase_mut(id)?;
+        if !matches!(
+            purchase.state,
+            LightningPurchaseState::InvoiceDisplayed { .. }
+                | LightningPurchaseState::AbandonedAwaitingFinal { .. }
+        ) {
+            return Err(KioskError::InvalidTransactionState(id));
+        }
+        purchase.state = LightningPurchaseState::Expired {
+            expired_at_unix_millis,
+        };
+        self.state.transaction_mut(id)?.status = TransactionStatus::Expired;
+        if self.active_transaction == Some(id) {
+            self.active_transaction = None;
+        }
+        Ok(())
+    }
+
+    /// Records funding which arrived after the customer abandoned the invoice.
+    /// The purchase is deliberately non-vendable and requires staff assistance.
+    pub fn lightning_paid_after_abandonment(
+        &mut self,
+        id: TransactionId,
+        reference: impl Into<String>,
+    ) -> Result<(), KioskError> {
+        let purchase = self.lightning_purchase_mut(id)?;
+        let LightningPurchaseState::AbandonedAwaitingFinal { invoice } = &purchase.state else {
+            return Err(KioskError::InvalidTransactionState(id));
+        };
+        purchase.state = LightningPurchaseState::AssistanceRequired {
+            invoice: invoice.clone(),
+            reason: AssistanceReason::PaidAfterAbandonment,
+            reference: reference.into(),
+        };
+        self.state.transaction_mut(id)?.status = TransactionStatus::AssistanceRequired;
         Ok(())
     }
 
@@ -637,7 +845,26 @@ impl KioskEngine {
         }
         let transaction = self.state.transaction(id)?.clone();
         match transaction.status {
+            TransactionStatus::AwaitingPayment
+                if matches!(transaction.payment, PaymentKind::Lightning { .. }) =>
+            {
+                return self.cancel_lightning(id);
+            }
             TransactionStatus::AwaitingPayment => {}
+            TransactionStatus::AwaitingVend
+                if matches!(transaction.payment, PaymentKind::Lightning { .. }) =>
+            {
+                let invoice = self.active_lightning_invoice(id)?;
+                self.lightning_purchase_mut(id)?.state =
+                    LightningPurchaseState::AssistanceRequired {
+                        invoice,
+                        reason: AssistanceReason::PaidAfterMdbDeadline,
+                        reference: format!("purchase {id}"),
+                    };
+                self.state.transaction_mut(id)?.status = TransactionStatus::AssistanceRequired;
+                self.active_transaction = None;
+                return Ok(());
+            }
             TransactionStatus::AwaitingVend => self.resolve_promo(&transaction, false)?,
             _ => return Err(KioskError::InvalidTransactionState(id)),
         }
@@ -676,17 +903,41 @@ impl KioskEngine {
                         .set_health(transaction.slot.clone(), SlotHealth::Ready);
                 }
                 self.state.transaction_mut(id)?.status = TransactionStatus::Succeeded;
+                if matches!(transaction.payment, PaymentKind::Lightning { .. }) {
+                    self.lightning_purchase_mut(id)?.state = LightningPurchaseState::Dispensed {
+                        completed_at_unix_millis: unix_millis_now(),
+                    };
+                }
             }
             VendResult::Failed => {
                 self.resolve_promo(&transaction, false)?;
                 self.state
                     .set_health(transaction.slot.clone(), SlotHealth::NeedsAttention);
-                self.state.transaction_mut(id)?.status = TransactionStatus::Failed;
+                if matches!(transaction.payment, PaymentKind::Lightning { .. }) {
+                    let invoice = self.active_lightning_invoice(id)?;
+                    self.lightning_purchase_mut(id)?.state =
+                        LightningPurchaseState::AssistanceRequired {
+                            invoice,
+                            reason: AssistanceReason::VendFailed,
+                            reference: format!("purchase {id}"),
+                        };
+                    self.state.transaction_mut(id)?.status = TransactionStatus::AssistanceRequired;
+                } else {
+                    self.state.transaction_mut(id)?.status = TransactionStatus::Failed;
+                }
             }
             VendResult::Uncertain => {
                 self.state
                     .set_health(transaction.slot.clone(), SlotHealth::NeedsAttention);
                 self.state.transaction_mut(id)?.status = TransactionStatus::Uncertain;
+                if matches!(transaction.payment, PaymentKind::Lightning { .. }) {
+                    let invoice = self.active_lightning_invoice(id)?;
+                    self.lightning_purchase_mut(id)?.state =
+                        LightningPurchaseState::VendUncertain {
+                            invoice,
+                            reference: format!("purchase {id}"),
+                        };
+                }
             }
         }
         self.active_transaction = None;
@@ -706,10 +957,69 @@ impl KioskEngine {
             self.decrement_inventory(&transaction.slot)?;
             self.resolve_promo(&transaction, true)?;
             self.state.transaction_mut(id)?.status = TransactionStatus::ResolvedDispensed;
+            if matches!(transaction.payment, PaymentKind::Lightning { .. }) {
+                self.lightning_purchase_mut(id)?.state = LightningPurchaseState::Resolved {
+                    resolution: AssistanceResolution::DeterminedDispensed,
+                    note: None,
+                    resolved_at_unix_millis: unix_millis_now(),
+                };
+            }
         } else {
             self.resolve_promo(&transaction, false)?;
-            self.state.transaction_mut(id)?.status = TransactionStatus::ResolvedNotDispensed;
+            if matches!(transaction.payment, PaymentKind::Lightning { .. }) {
+                let invoice = self.active_lightning_invoice(id)?;
+                self.lightning_purchase_mut(id)?.state =
+                    LightningPurchaseState::AssistanceRequired {
+                        invoice,
+                        reason: AssistanceReason::VendFailed,
+                        reference: format!("purchase {id}"),
+                    };
+                self.state.transaction_mut(id)?.status = TransactionStatus::AssistanceRequired;
+            } else {
+                self.state.transaction_mut(id)?.status = TransactionStatus::ResolvedNotDispensed;
+            }
         }
+        Ok(())
+    }
+
+    pub fn resolve_assistance(
+        &mut self,
+        id: TransactionId,
+        resolution: AssistanceResolution,
+        note: Option<String>,
+    ) -> Result<(), KioskError> {
+        let purchase = self
+            .state
+            .lightning_purchase(id)
+            .ok_or(KioskError::UnknownTransaction(id))?;
+        if !matches!(
+            purchase.state,
+            LightningPurchaseState::AssistanceRequired { .. }
+        ) {
+            return Err(KioskError::InvalidTransactionState(id));
+        }
+        let slot = purchase.slot.clone();
+        let owns_reservation = purchase.state.holds_inventory_reservation();
+        let dispensed = matches!(
+            resolution,
+            AssistanceResolution::ProductProvided | AssistanceResolution::DeterminedDispensed
+        );
+        if dispensed {
+            if !owns_reservation && self.state.available_inventory(&slot) == 0 {
+                return Err(KioskError::NoAvailableInventory(slot));
+            }
+            self.decrement_inventory(&slot)?;
+        }
+        self.lightning_purchase_mut(id)?.state = LightningPurchaseState::Resolved {
+            resolution,
+            note,
+            resolved_at_unix_millis: unix_millis_now(),
+        };
+        self.state.transaction_mut(id)?.status = if dispensed {
+            TransactionStatus::ResolvedDispensed
+        } else {
+            TransactionStatus::ResolvedNotDispensed
+        };
         Ok(())
     }
 
@@ -768,7 +1078,7 @@ impl KioskEngine {
             .catalog
             .slot(slot_id)
             .ok_or_else(|| KioskError::UnknownSlot(slot_id.clone()))?;
-        Ok(slot.enabled() && self.state.inventory(slot_id) > 0)
+        Ok(slot.enabled() && self.state.available_inventory(slot_id) > 0)
     }
 
     fn create_transaction(
@@ -777,8 +1087,7 @@ impl KioskEngine {
         payment: PaymentKind,
         status: TransactionStatus,
     ) -> TransactionId {
-        self.state.next_transaction_id += 1;
-        let id = TransactionId(self.state.next_transaction_id);
+        let id = TransactionId::new();
         self.state.transactions.push(Transaction {
             id,
             slot: selection.slot.clone(),
@@ -796,6 +1105,46 @@ impl KioskEngine {
             transaction.slot == *slot && transaction.status == TransactionStatus::Uncertain
         })
     }
+
+    fn require_active_lightning(&self, id: TransactionId) -> Result<(), KioskError> {
+        if self.active_transaction != Some(id) {
+            return Err(KioskError::TransactionNotActive(id));
+        }
+        if !matches!(
+            self.state.transaction(id)?.payment,
+            PaymentKind::Lightning { .. }
+        ) {
+            return Err(KioskError::InvalidTransactionState(id));
+        }
+        Ok(())
+    }
+
+    fn lightning_purchase_mut(
+        &mut self,
+        id: TransactionId,
+    ) -> Result<&mut LightningPurchase, KioskError> {
+        self.state
+            .lightning_purchases
+            .get_mut(&id)
+            .ok_or(KioskError::UnknownTransaction(id))
+    }
+
+    fn active_lightning_invoice(&self, id: TransactionId) -> Result<LightningInvoice, KioskError> {
+        let purchase = self
+            .state
+            .lightning_purchase(id)
+            .ok_or(KioskError::UnknownTransaction(id))?;
+        match &purchase.state {
+            LightningPurchaseState::AwaitingVend { invoice, .. }
+            | LightningPurchaseState::AssistanceRequired { invoice, .. }
+            | LightningPurchaseState::VendUncertain { invoice, .. } => Ok(invoice.clone()),
+            _ => Err(KioskError::InvalidTransactionState(id)),
+        }
+    }
+}
+
+fn unix_millis_now() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -833,6 +1182,8 @@ pub enum KioskError {
     InvalidTransactionState(TransactionId),
     #[error("slot {0} inventory is already zero")]
     InventoryAlreadyZero(SlotId),
+    #[error("slot {0} has no unreserved inventory available")]
+    NoAvailableInventory(SlotId),
     #[error("slot {0} has an uncertain transaction that must be reconciled first")]
     UnresolvedTransaction(SlotId),
 }
@@ -866,7 +1217,7 @@ mod tests {
         id = "B1"
         product = "snack"
         payment = "lightning"
-        price_cents = 250
+        price_msats = 250000
     "#;
 
     fn engine() -> KioskEngine {
@@ -880,6 +1231,15 @@ mod tests {
             state.set_inventory(SlotId::from_str(slot).unwrap(), 2);
         }
         KioskEngine::new(catalog, state)
+    }
+
+    fn invoice() -> LightningInvoice {
+        LightningInvoice {
+            bolt11: "lnbc-test".to_owned(),
+            operation_id: [1; 32],
+            payment_hash: [2; 32],
+            expires_at_unix_seconds: 100,
+        }
     }
 
     fn transaction_id(outcome: SelectionOutcome) -> TransactionId {
@@ -1040,8 +1400,92 @@ mod tests {
             .machine_selected(&SlotId::from_str("B1").unwrap())
             .unwrap();
         let id = transaction_id(outcome);
+        engine.begin_lightning_invoice(id, 100).unwrap();
+        engine.lightning_invoice_created(id, invoice()).unwrap();
         let approved = engine.lightning_payment_accepted(id).unwrap();
         assert!(matches!(approved, SelectionOutcome::VendApproved { .. }));
+    }
+
+    #[test]
+    fn vmc_cancellation_after_lightning_funding_requires_assistance() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("B1").unwrap();
+        let id = transaction_id(engine.machine_selected(&slot).unwrap());
+        engine.begin_lightning_invoice(id, 100).unwrap();
+        engine.lightning_invoice_created(id, invoice()).unwrap();
+        engine.lightning_payment_accepted(id).unwrap();
+
+        engine.vend_cancelled(id).unwrap();
+
+        assert!(matches!(
+            engine.state().lightning_purchase(id).unwrap().state(),
+            LightningPurchaseState::AssistanceRequired {
+                reason: AssistanceReason::PaidAfterMdbDeadline,
+                ..
+            }
+        ));
+        assert_eq!(
+            engine.state().transaction(id).unwrap().status(),
+            TransactionStatus::AssistanceRequired
+        );
+        assert_eq!(engine.state().inventory(&slot), 2);
+    }
+
+    #[test]
+    fn abandoning_a_displayed_invoice_releases_inventory_but_never_vends_late_payment() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("B1").unwrap();
+        engine.set_inventory(slot.clone(), 1).unwrap();
+        let id = transaction_id(engine.machine_selected(&slot).unwrap());
+        engine.begin_lightning_invoice(id, 100).unwrap();
+        engine.lightning_invoice_created(id, invoice()).unwrap();
+        assert_eq!(engine.state().reserved_inventory(&slot), 1);
+        assert_eq!(engine.state().available_inventory(&slot), 0);
+
+        engine.cancel_lightning(id).unwrap();
+        assert_eq!(engine.state().reserved_inventory(&slot), 0);
+        assert_eq!(engine.state().available_inventory(&slot), 1);
+        engine
+            .lightning_paid_after_abandonment(id, "late payment")
+            .unwrap();
+        assert!(matches!(
+            &engine.state().lightning_purchase(id).unwrap().state,
+            LightningPurchaseState::AssistanceRequired {
+                reason: AssistanceReason::PaidAfterAbandonment,
+                ..
+            }
+        ));
+        assert_eq!(engine.state().reserved_inventory(&slot), 0);
+        assert_eq!(engine.state().available_inventory(&slot), 1);
+        assert!(matches!(
+            engine.lightning_payment_accepted(id),
+            Err(KioskError::TransactionNotActive(_))
+        ));
+        engine
+            .resolve_assistance(id, AssistanceResolution::ProductProvided, None)
+            .unwrap();
+        assert_eq!(engine.state().inventory(&slot), 0);
+        assert_eq!(
+            engine.state().transaction(id).unwrap().status(),
+            TransactionStatus::ResolvedDispensed
+        );
+    }
+
+    #[test]
+    fn restart_abandons_a_displayed_invoice_and_releases_its_reservation() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("B1").unwrap();
+        engine.set_inventory(slot.clone(), 1).unwrap();
+        let id = transaction_id(engine.machine_selected(&slot).unwrap());
+        engine.begin_lightning_invoice(id, 100).unwrap();
+        engine.lightning_invoice_created(id, invoice()).unwrap();
+
+        let recovered = KioskEngine::new(engine.catalog().clone(), engine.state().clone());
+        assert_eq!(recovered.state().reserved_inventory(&slot), 0);
+        assert!(matches!(
+            &recovered.state().lightning_purchase(id).unwrap().state,
+            LightningPurchaseState::AbandonedAwaitingFinal { .. }
+        ));
     }
 
     #[test]

@@ -1,29 +1,33 @@
-#[path = "lv_kiosk/mdb.rs"]
 mod mdb;
-#[path = "lv_kiosk/notice.rs"]
 mod notice;
+mod store;
 
 use clap::Parser;
 use iced::widget::{
     button, column, container, image, mouse_area, operation, progress_bar, rich_text, row,
     scrollable, span, text, Column, Id, Row,
 };
+use iced::widget::{qr_code, qr_code::Data as QrData};
 use iced::{time, window, Color, Element, Length, Size, Subscription, Task, Theme};
-use lv_mdb_tools::kiosk::{
-    ArmMode, Catalog, KioskEngine, MachineSelection, PaymentKind, PaymentPolicy, Product,
-    PromoCode, SelectionOutcome, SlotHealth, SlotId, StateStore, TransactionId, TransactionStatus,
+use lv_core::{
+    ArmMode, Catalog, KioskEngine, LightningInvoice, LightningPurchaseState, MachineSelection,
+    ManagerResponse, Msats, PaymentKind, PaymentPolicy, Product, PromoCode, SelectionOutcome,
+    SlotHealth, SlotId, TransactionId, TransactionStatus,
 };
-use lv_mdb_tools::{
-    ItemNumber, Level1Amount, MdbConfig, SessionEndReason, VendDecisionError, VendId,
+use lv_mdb::{ItemNumber, Level1Amount, MdbConfig, SessionEndReason, VendDecisionError, VendId};
+use lv_vendimint::{
+    ClaimRequest, PaymentController, PaymentControllerConfig, PaymentControllerEvent,
+    PaymentMachineState,
 };
 use mdb::{ControllerEvent, DecisionFailure, MdbController};
 use notice::{Notice, NoticeBanner, NoticeSeverity};
 use std::fs::File;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
+use store::StateStore;
 
 const CUSTOMER_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
-const LIGHTNING_TIMEOUT: Duration = Duration::from_secs(45);
+const LIGHTNING_TIMEOUT: Duration = Duration::from_secs(40);
 const RATE_LIMIT_RESET: Duration = Duration::from_secs(60);
 const RATE_LIMIT_DELAY: Duration = Duration::from_secs(3);
 const ADMIN_LOCKOUT: Duration = Duration::from_secs(30);
@@ -33,6 +37,7 @@ const PENDING_PROMO_TIMEOUT: Duration = Duration::from_secs(40);
 const KEYPAD_BUTTON_HEIGHT: f32 = 80.0;
 const MDB_APPLICATION_RESPONSE_TIME: Duration = Duration::from_secs(46);
 const MDB_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(about = "Portrait LightningVEND kiosk UI")]
@@ -52,6 +57,10 @@ struct Args {
     /// Persistent redb state file.
     #[arg(long, default_value = "lv-kiosk.redb")]
     database: PathBuf,
+
+    /// Persistent Vendimint identity/wallet directory. Omit to simulate Lightning.
+    #[arg(long, value_name = "PATH")]
+    vendimint_data: Option<PathBuf>,
 
     /// Promo entitlements to load when --seed-demo is used.
     #[arg(long, default_value = "config/promo_codes.csv")]
@@ -136,6 +145,10 @@ impl ApplicationState {
                 if app.is_hardware() {
                     subscriptions.push(time::every(MDB_POLL_INTERVAL).map(|_| Message::PollMdb));
                 }
+                if app.uses_vendimint() {
+                    subscriptions
+                        .push(time::every(PAYMENT_POLL_INTERVAL).map(|_| Message::PollPayments));
+                }
                 if app.animations_active() {
                     subscriptions.push(window::frames().map(Message::AnimationFrame));
                 }
@@ -151,6 +164,9 @@ struct KioskApp {
     store: StateStore,
     backend: Backend,
     machine_status: MachineStatus,
+    payment_backend: PaymentBackend,
+    payment_status: PaymentStatus,
+    pending_claim: Option<ClaimRequest>,
     active_mdb_vend: Option<ActiveMdbVend>,
     admin_pin: String,
     page: Page,
@@ -198,6 +214,23 @@ enum Backend {
     Hardware(MdbController),
 }
 
+enum PaymentBackend {
+    Simulator,
+    Vendimint(PaymentController),
+}
+
+enum PaymentStatus {
+    Simulator,
+    Starting,
+    Unclaimed {
+        pairing_payload: String,
+        qr: Option<QrData>,
+    },
+    ClaimedUnconfigured,
+    Ready,
+    Unavailable(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MachineStatus {
     Simulator,
@@ -210,6 +243,7 @@ enum MachineStatus {
 struct ActiveMdbVend {
     vend_id: VendId,
     transaction_id: TransactionId,
+    requested_price: Level1Amount,
     approval_sent: bool,
 }
 
@@ -229,16 +263,23 @@ enum PromoEntryContext {
     },
 }
 
-#[derive(Clone)]
 enum Page {
     Ready,
     PromoEntry(PromoEntryContext),
     Promo,
+    LightningLoading {
+        transaction_id: TransactionId,
+        selection: MachineSelection,
+        price: Msats,
+        started: Instant,
+    },
     Lightning {
         transaction_id: TransactionId,
         selection: MachineSelection,
-        price_cents: u32,
+        price: Msats,
         started: Instant,
+        confirming_exit: bool,
+        qr: QrData,
     },
     Dispensing {
         transaction_id: TransactionId,
@@ -261,7 +302,7 @@ enum Destination {
     Admin,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimulatedVendResult {
     Success,
     Failure,
@@ -273,6 +314,9 @@ enum Message {
     Tick(Instant),
     AnimationFrame(Instant),
     PollMdb,
+    PollPayments,
+    ConfirmClaim,
+    RejectClaim,
     OpenPromo,
     PromoDigit(char),
     PromoBackspace,
@@ -285,7 +329,9 @@ enum Message {
     CloseAdmin,
     MachineSelected(SlotId),
     LightningAccepted(TransactionId),
-    LightningCancelled(TransactionId),
+    RequestLightningExit(TransactionId),
+    KeepLightningOpen(TransactionId),
+    ConfirmLightningExit(TransactionId),
     SimulatedVend(TransactionId, SimulatedVendResult),
     DismissResult(Destination),
     ArmFreeVend,
@@ -314,8 +360,7 @@ impl KioskApp {
                     args.promo_codes.display()
                 )
             })?;
-            state = store
-                .replace_codes_from_csv(&state, &catalog, file)
+            state = StateStore::replace_codes_from_csv(&state, &catalog, file)
                 .map_err(|error| error.to_string())?;
             for slot in catalog.slots() {
                 state.set_inventory(slot.id().clone(), 3);
@@ -336,12 +381,37 @@ impl KioskApp {
             }
             None => (Backend::Simulator, MachineStatus::Simulator),
         };
+        let (payment_backend, payment_status) = match &args.vendimint_data {
+            Some(storage_path) => {
+                let controller = PaymentController::spawn(PaymentControllerConfig::mainnet(
+                    storage_path.clone(),
+                ))
+                .map_err(|error| format!("could not start the payment controller: {error}"))?;
+                for purchase in engine.state().lightning_purchases() {
+                    if let LightningPurchaseState::AbandonedAwaitingFinal { invoice } =
+                        purchase.state()
+                    {
+                        controller
+                            .observe_invoice(purchase.id(), invoice.operation_id)
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+                (
+                    PaymentBackend::Vendimint(controller),
+                    PaymentStatus::Starting,
+                )
+            }
+            None => (PaymentBackend::Simulator, PaymentStatus::Simulator),
+        };
         let now = Instant::now();
         Ok(Self {
             engine,
             store,
             backend,
             machine_status,
+            payment_backend,
+            payment_status,
+            pending_claim: None,
             active_mdb_vend: None,
             admin_pin: args.admin_pin.clone(),
             page: Page::Ready,
@@ -377,6 +447,9 @@ impl KioskApp {
             Message::Tick(now) => self.tick(now),
             Message::AnimationFrame(now) => self.animate_frame(now),
             Message::PollMdb => self.poll_mdb(),
+            Message::PollPayments => self.poll_payments(),
+            Message::ConfirmClaim => self.respond_to_claim(true),
+            Message::RejectClaim => self.respond_to_claim(false),
             Message::OpenPromo => {
                 self.promo_input.clear();
                 self.notice.clear();
@@ -420,7 +493,9 @@ impl KioskApp {
             }
             Message::MachineSelected(slot) => self.machine_selected(&slot, None),
             Message::LightningAccepted(id) => self.lightning_accepted(id),
-            Message::LightningCancelled(id) => self.lightning_cancelled(id),
+            Message::RequestLightningExit(id) => self.request_lightning_exit(id),
+            Message::KeepLightningOpen(id) => self.keep_lightning_open(id),
+            Message::ConfirmLightningExit(id) => self.lightning_cancelled(id),
             Message::SimulatedVend(id, result) => self.simulated_vend(id, result),
             Message::DismissResult(destination) => {
                 self.page = match destination {
@@ -493,8 +568,267 @@ impl KioskApp {
         matches!(self.backend, Backend::Hardware(_))
     }
 
+    const fn uses_vendimint(&self) -> bool {
+        matches!(self.payment_backend, PaymentBackend::Vendimint(_))
+    }
+
     fn animations_active(&self) -> bool {
-        self.notice.is_animating() || matches!(&self.page, Page::Dispensing { .. })
+        self.notice.is_animating()
+            || matches!(
+                &self.page,
+                Page::LightningLoading { .. } | Page::Dispensing { .. }
+            )
+    }
+
+    fn poll_payments(&mut self) {
+        let mut events = Vec::new();
+        if let PaymentBackend::Vendimint(controller) = &mut self.payment_backend {
+            while let Some(event) = controller.try_event() {
+                events.push(event);
+            }
+        }
+        for event in events {
+            self.handle_payment_event(event);
+        }
+    }
+
+    fn respond_to_claim(&mut self, accepted: bool) {
+        let Some(claim) = self.pending_claim.take() else {
+            return;
+        };
+        if claim.respond(accepted).is_err() {
+            self.payment_status = PaymentStatus::Unavailable(
+                "The manager claim expired before it could be confirmed.".to_owned(),
+            );
+        } else if accepted {
+            self.payment_status = PaymentStatus::Starting;
+        }
+    }
+
+    fn handle_payment_event(&mut self, event: PaymentControllerEvent) {
+        match event {
+            PaymentControllerEvent::MachineStateChanged(state) => {
+                self.payment_status = match state {
+                    PaymentMachineState::Unclaimed { pairing_payload } => {
+                        let qr = QrData::new(pairing_payload.as_bytes()).ok();
+                        PaymentStatus::Unclaimed {
+                            pairing_payload,
+                            qr,
+                        }
+                    }
+                    PaymentMachineState::ClaimedUnconfigured => PaymentStatus::ClaimedUnconfigured,
+                    PaymentMachineState::Ready => PaymentStatus::Ready,
+                };
+            }
+            PaymentControllerEvent::ClaimRequested(claim) => {
+                self.pending_claim = Some(claim);
+            }
+            PaymentControllerEvent::InvoiceCreated {
+                purchase_id,
+                invoice,
+            } => self.payment_invoice_created(purchase_id, invoice),
+            PaymentControllerEvent::InvoiceCreationFailed { purchase_id, error } => {
+                self.payment_invoice_creation_failed(purchase_id, &error);
+            }
+            PaymentControllerEvent::InvoiceFunded { purchase_id } => {
+                self.payment_invoice_funded(purchase_id);
+            }
+            PaymentControllerEvent::InvoiceExpired {
+                purchase_id,
+                expired_at_unix_millis,
+            } => self.payment_invoice_expired(purchase_id, expired_at_unix_millis),
+            PaymentControllerEvent::ManagerRequest(request) => {
+                let _ = request.respond(ManagerResponse::ProtocolError {
+                    message: "manager state commands are not enabled in this kiosk build"
+                        .to_owned(),
+                });
+            }
+            PaymentControllerEvent::Unavailable(error) => {
+                self.payment_status = PaymentStatus::Unavailable(error);
+            }
+        }
+    }
+
+    fn payment_invoice_created(&mut self, id: TransactionId, invoice: LightningInvoice) {
+        let required_expiration = match &self.page {
+            Page::LightningLoading {
+                transaction_id,
+                started,
+                ..
+            } if *transaction_id == id => unix_seconds_now().saturating_add(duration_seconds_ceil(
+                LIGHTNING_TIMEOUT.saturating_sub(self.now.saturating_duration_since(*started)),
+            )),
+            _ => 0,
+        };
+        let expires_too_soon = invoice.expires_at_unix_seconds < required_expiration;
+        let qr = QrData::new(invoice.bolt11.as_bytes());
+        if let Err(error) = self.engine.lightning_invoice_created(id, invoice) {
+            self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            return;
+        }
+        if !self.persist() {
+            if matches!(
+                self.engine
+                    .state()
+                    .lightning_purchase(id)
+                    .map(lv_core::LightningPurchase::state),
+                Some(LightningPurchaseState::InvoiceDisplayed { .. })
+            ) {
+                let _ = self.engine.cancel_lightning(id);
+                self.persist();
+            }
+            self.deny_matching_lightning_mdb(id);
+            self.page = Page::Ready;
+            return;
+        }
+
+        let displayed = matches!(
+            self.engine
+                .state()
+                .lightning_purchase(id)
+                .map(lv_core::LightningPurchase::state),
+            Some(LightningPurchaseState::InvoiceDisplayed { .. })
+        );
+        if !displayed {
+            return;
+        }
+        if expires_too_soon {
+            let _ = self.engine.cancel_lightning(id);
+            self.persist();
+            self.deny_matching_lightning_mdb(id);
+            self.page = Page::Ready;
+            self.show_transient_notice(
+                "The payment service returned an invoice that expires too soon. Please try again.",
+                NoticeSeverity::Warning,
+            );
+            return;
+        }
+        let Ok(qr) = qr else {
+            let _ = self.engine.cancel_lightning(id);
+            self.persist();
+            self.deny_matching_lightning_mdb(id);
+            self.page = Page::Ready;
+            self.show_persistent_notice(
+                "The Lightning invoice could not be rendered as a QR code.",
+                NoticeSeverity::Error,
+            );
+            return;
+        };
+        let loading = match &self.page {
+            Page::LightningLoading {
+                transaction_id,
+                selection,
+                price,
+                started,
+            } if *transaction_id == id => Some((selection.clone(), *price, *started)),
+            _ => None,
+        };
+        if let Some((selection, price, started)) = loading {
+            self.page = Page::Lightning {
+                transaction_id: id,
+                selection,
+                price,
+                started,
+                confirming_exit: false,
+                qr,
+            };
+        } else {
+            let _ = self.engine.cancel_lightning(id);
+            self.persist();
+            self.deny_matching_lightning_mdb(id);
+        }
+    }
+
+    fn payment_invoice_creation_failed(&mut self, id: TransactionId, error: &str) {
+        if let Err(state_error) = self
+            .engine
+            .lightning_invoice_creation_failed(id, error.to_owned())
+        {
+            self.show_persistent_notice(state_error.to_string(), NoticeSeverity::Error);
+            return;
+        }
+        self.persist();
+        self.deny_matching_lightning_mdb(id);
+        if matches!(
+            self.page,
+            Page::LightningLoading { transaction_id, .. } if transaction_id == id
+        ) {
+            self.page = Page::Ready;
+            self.show_transient_notice(
+                "Lightning is temporarily unavailable. Please try again.",
+                NoticeSeverity::Warning,
+            );
+        }
+    }
+
+    fn payment_invoice_funded(&mut self, id: TransactionId) {
+        let state = self
+            .engine
+            .state()
+            .lightning_purchase(id)
+            .map(|purchase| purchase.state().clone());
+        match state {
+            Some(LightningPurchaseState::InvoiceDisplayed { .. }) => {
+                self.lightning_accepted(id);
+            }
+            Some(LightningPurchaseState::AbandonedAwaitingFinal { .. }) => {
+                if let Err(error) = self.engine.lightning_paid_after_abandonment(
+                    id,
+                    format!("Vendimint reported late funding for purchase {id}"),
+                ) {
+                    self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+                } else {
+                    self.persist();
+                    eprintln!(
+                        "Lightning purchase {id} was funded after abandonment; staff assistance required"
+                    );
+                }
+            }
+            Some(
+                LightningPurchaseState::AwaitingVend { .. }
+                | LightningPurchaseState::AssistanceRequired { .. }
+                | LightningPurchaseState::VendUncertain { .. }
+                | LightningPurchaseState::Dispensed { .. },
+            ) => {}
+            Some(_) | None => self.show_persistent_notice(
+                format!("Vendimint funded purchase {id} in an unexpected state."),
+                NoticeSeverity::Error,
+            ),
+        }
+    }
+
+    fn payment_invoice_expired(&mut self, id: TransactionId, expired_at_unix_millis: u64) {
+        if let Err(error) = self
+            .engine
+            .lightning_invoice_expired(id, expired_at_unix_millis)
+        {
+            if self.engine.state().lightning_purchase(id).is_some() {
+                eprintln!("Ignoring duplicate or stale expiration for purchase {id}: {error}");
+            }
+            return;
+        }
+        self.persist();
+        self.deny_matching_lightning_mdb(id);
+        if matches!(
+            self.page,
+            Page::Lightning { transaction_id, .. } if transaction_id == id
+        ) {
+            self.page = Page::Ready;
+            self.show_transient_notice(
+                "The Lightning invoice expired. Please make the selection again.",
+                NoticeSeverity::Warning,
+            );
+        }
+    }
+
+    fn deny_matching_lightning_mdb(&mut self, id: TransactionId) {
+        if let Some(active) = self
+            .active_mdb_vend
+            .filter(|active| active.transaction_id == id)
+        {
+            self.active_mdb_vend = None;
+            self.deny_mdb(active.vend_id);
+        }
     }
 
     fn poll_mdb(&mut self) {
@@ -800,7 +1134,12 @@ impl KioskApp {
         }
 
         let expired_lightning = match &self.page {
-            Page::Lightning {
+            Page::LightningLoading {
+                transaction_id,
+                started,
+                ..
+            }
+            | Page::Lightning {
                 transaction_id,
                 started,
                 ..
@@ -810,10 +1149,12 @@ impl KioskApp {
             _ => None,
         };
         if let Some(id) = expired_lightning {
-            self.cancel_lightning_with_notice(
-                id,
-                "Lightning payment timed out. No payment was taken.",
-            );
+            let notice = if self.uses_vendimint() {
+                "Payment time ended. Do not pay the old invoice; if you already paid it, please find a staff member."
+            } else {
+                "Lightning payment timed out. No payment was taken."
+            };
+            self.cancel_lightning_with_notice(id, notice);
         }
     }
 
@@ -935,32 +1276,8 @@ impl KioskApp {
             Ok(SelectionOutcome::LightningPaymentRequired {
                 transaction_id,
                 selection,
-                price_cents,
-            }) => {
-                if !self.persist() {
-                    let _ = self.engine.vend_cancelled(transaction_id);
-                    self.persist();
-                    if let Some(request) = mdb_request {
-                        self.deny_mdb(request.vend_id);
-                    }
-                    self.page = Page::Ready;
-                    return;
-                }
-                if let Some(request) = mdb_request {
-                    self.active_mdb_vend = Some(ActiveMdbVend {
-                        vend_id: request.vend_id,
-                        transaction_id,
-                        approval_sent: false,
-                    });
-                }
-                self.notice.clear();
-                self.page = Page::Lightning {
-                    transaction_id,
-                    selection,
-                    price_cents,
-                    started: self.now,
-                };
-            }
+                price,
+            }) => self.begin_lightning(transaction_id, selection, price, mdb_request),
             Ok(SelectionOutcome::VendApproved {
                 transaction_id,
                 selection,
@@ -979,6 +1296,7 @@ impl KioskApp {
                     self.active_mdb_vend = Some(ActiveMdbVend {
                         vend_id: request.vend_id,
                         transaction_id,
+                        requested_price: request.requested_price,
                         approval_sent: false,
                     });
                 }
@@ -989,7 +1307,7 @@ impl KioskApp {
                     started: self.now,
                 };
                 if mdb_request.is_some() {
-                    self.approve_active_mdb_vend(&payment);
+                    self.approve_active_mdb_vend();
                 }
             }
             Ok(SelectionOutcome::Denied(message)) => {
@@ -1007,12 +1325,173 @@ impl KioskApp {
         }
     }
 
+    fn begin_lightning(
+        &mut self,
+        transaction_id: TransactionId,
+        selection: MachineSelection,
+        price: Msats,
+        mdb_request: Option<MdbVendRequest>,
+    ) {
+        if self.uses_vendimint() {
+            self.begin_vendimint_lightning(transaction_id, selection, price, mdb_request);
+        } else {
+            self.begin_simulated_lightning(transaction_id, selection, price, mdb_request);
+        }
+    }
+
+    fn begin_simulated_lightning(
+        &mut self,
+        transaction_id: TransactionId,
+        selection: MachineSelection,
+        price: Msats,
+        mdb_request: Option<MdbVendRequest>,
+    ) {
+        let invoice = simulated_invoice(transaction_id);
+        let qr = match QrData::new(invoice.bolt11.as_bytes()) {
+            Ok(qr) => qr,
+            Err(error) => {
+                let _ = self.engine.vend_cancelled(transaction_id);
+                self.persist();
+                if let Some(request) = mdb_request {
+                    self.deny_mdb(request.vend_id);
+                }
+                self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+                return;
+            }
+        };
+        let invoice_result = self
+            .engine
+            .begin_lightning_invoice(transaction_id, invoice.expires_at_unix_seconds)
+            .and_then(|()| {
+                self.engine
+                    .lightning_invoice_created(transaction_id, invoice)
+            });
+        if let Err(error) = invoice_result {
+            let _ = self.engine.vend_cancelled(transaction_id);
+            self.persist();
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            self.page = Page::Ready;
+            self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            return;
+        }
+        if !self.persist() {
+            let _ = self.engine.vend_cancelled(transaction_id);
+            self.persist();
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            self.page = Page::Ready;
+            return;
+        }
+        if let Some(request) = mdb_request {
+            self.active_mdb_vend = Some(ActiveMdbVend {
+                vend_id: request.vend_id,
+                transaction_id,
+                requested_price: request.requested_price,
+                approval_sent: false,
+            });
+        }
+        self.notice.clear();
+        self.page = Page::Lightning {
+            transaction_id,
+            selection,
+            price,
+            started: self.now,
+            confirming_exit: false,
+            qr,
+        };
+    }
+
+    fn begin_vendimint_lightning(
+        &mut self,
+        transaction_id: TransactionId,
+        selection: MachineSelection,
+        price: Msats,
+        mdb_request: Option<MdbVendRequest>,
+    ) {
+        if !matches!(self.payment_status, PaymentStatus::Ready) {
+            let _ = self.engine.vend_cancelled(transaction_id);
+            self.persist();
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            self.show_transient_notice(
+                "Lightning payments are not ready yet.",
+                NoticeSeverity::Warning,
+            );
+            return;
+        }
+
+        // First commit the inventory reservation created by machine_selected.
+        if !self.persist() {
+            let _ = self.engine.vend_cancelled(transaction_id);
+            self.persist();
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            return;
+        }
+        let latest_expiration = unix_seconds_now().saturating_add(LIGHTNING_TIMEOUT.as_secs());
+        if let Err(error) = self
+            .engine
+            .begin_lightning_invoice(transaction_id, latest_expiration)
+        {
+            let _ = self.engine.vend_cancelled(transaction_id);
+            self.persist();
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
+            return;
+        }
+        if !self.persist() {
+            let _ = self.engine.lightning_invoice_creation_failed(
+                transaction_id,
+                "invoice request was not sent because durable state could not be saved",
+            );
+            self.persist();
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            return;
+        }
+
+        if let Some(request) = mdb_request {
+            self.active_mdb_vend = Some(ActiveMdbVend {
+                vend_id: request.vend_id,
+                transaction_id,
+                requested_price: request.requested_price,
+                approval_sent: false,
+            });
+        }
+        let description = format!("{} ({})", selection.product_name(), selection.slot());
+        self.notice.clear();
+        self.page = Page::LightningLoading {
+            transaction_id,
+            selection,
+            price,
+            started: self.now,
+        };
+
+        let create_result = match &self.payment_backend {
+            PaymentBackend::Vendimint(controller) => {
+                controller.create_invoice(transaction_id, price, description, LIGHTNING_TIMEOUT)
+            }
+            PaymentBackend::Simulator => unreachable!("checked by begin_lightning"),
+        };
+        if let Err(error) = create_result {
+            self.payment_invoice_creation_failed(transaction_id, &error.to_string());
+        }
+    }
+
     fn lightning_accepted(&mut self, id: TransactionId) {
         match self.engine.lightning_payment_accepted(id) {
             Ok(SelectionOutcome::VendApproved {
                 transaction_id,
                 selection,
-                payment,
+                ..
             }) => {
                 if !self.persist() {
                     let _ = self.engine.vend_cancelled(transaction_id);
@@ -1030,7 +1509,7 @@ impl KioskApp {
                 };
                 self.notice.clear();
                 if self.is_hardware() {
-                    self.approve_active_mdb_vend(&payment);
+                    self.approve_active_mdb_vend();
                 }
             }
             Ok(_) => self
@@ -1043,6 +1522,34 @@ impl KioskApp {
 
     fn lightning_cancelled(&mut self, id: TransactionId) {
         self.cancel_lightning(id, None);
+    }
+
+    fn request_lightning_exit(&mut self, id: TransactionId) {
+        if let Page::Lightning {
+            transaction_id,
+            confirming_exit,
+            ..
+        } = &mut self.page
+        {
+            if *transaction_id == id {
+                *confirming_exit = true;
+                self.record_customer_activity();
+            }
+        }
+    }
+
+    fn keep_lightning_open(&mut self, id: TransactionId) {
+        if let Page::Lightning {
+            transaction_id,
+            confirming_exit,
+            ..
+        } = &mut self.page
+        {
+            if *transaction_id == id {
+                *confirming_exit = false;
+                self.record_customer_activity();
+            }
+        }
     }
 
     fn cancel_lightning_with_notice(&mut self, id: TransactionId, notice: &str) {
@@ -1110,30 +1617,46 @@ impl KioskApp {
                     result
                 };
                 self.record_customer_activity();
-                let destination = match payment {
+                let destination = match &payment {
                     Some(PaymentKind::Promo { .. }) => Destination::Promo,
                     Some(PaymentKind::FreeVend | PaymentKind::MaintenanceTest) => {
                         Destination::Admin
                     }
                     _ => Destination::Ready,
                 };
-                let (title, default_body) = match result {
-                    SimulatedVendResult::Success => ("Enjoy!", ""),
-                    SimulatedVendResult::Failure => (
+                let is_lightning = matches!(payment, Some(PaymentKind::Lightning { .. }));
+                let (title, default_body) = match (result, is_lightning) {
+                    (SimulatedVendResult::Success, _) => ("Enjoy!", ""),
+                    (SimulatedVendResult::Failure, true) => (
+                        "Could not dispense",
+                        "Your payment was received, but the item was not dispensed. Please find a staff member for assistance.",
+                    ),
+                    (SimulatedVendResult::Failure, false) => (
                         "Could not dispense",
                         "Nothing was claimed or charged. The slot now needs attention.",
                     ),
-                    SimulatedVendResult::Uncertain => (
+                    (SimulatedVendResult::Uncertain, true) => (
+                        "Result needs review",
+                        "Your payment was received, but the dispense result is uncertain. Please find a staff member for assistance.",
+                    ),
+                    (SimulatedVendResult::Uncertain, false) => (
                         "Result needs review",
                         "The entitlement is reserved and an administrator must reconcile it.",
                     ),
+                };
+                let body = if is_lightning && result != SimulatedVendResult::Success {
+                    default_body
+                } else {
+                    body_override
+                        .filter(|body| !body.is_empty())
+                        .unwrap_or(default_body)
                 };
                 self.page = Page::Result {
                     title: title.to_owned(),
                     body: if persistence_failed {
                         "The machine reported a result, but the kiosk could not save it. An administrator must reconcile this transaction.".to_owned()
                     } else {
-                        body_override.unwrap_or(default_body).to_owned()
+                        body.to_owned()
                     },
                     destination,
                 };
@@ -1189,7 +1712,7 @@ impl KioskApp {
         }
     }
 
-    fn approve_active_mdb_vend(&mut self, payment: &PaymentKind) {
+    fn approve_active_mdb_vend(&mut self) {
         let Some(active) = self.active_mdb_vend else {
             self.show_persistent_notice(
                 "The MDB selection is no longer active.",
@@ -1197,14 +1720,7 @@ impl KioskApp {
             );
             return;
         };
-        let amount = match approval_amount(payment) {
-            Ok(amount) => amount,
-            Err(error) => {
-                self.deny_mdb(active.vend_id);
-                self.cancel_mdb_transaction(active.vend_id, &error);
-                return;
-            }
-        };
+        let amount = approval_amount(active.requested_price);
         let result = match &self.backend {
             Backend::Hardware(controller) => controller.approve(active.vend_id, amount),
             Backend::Simulator => return,
@@ -1315,19 +1831,41 @@ impl KioskApp {
         let machine_unavailable = self.is_hardware()
             && !matches!(self.machine_status, MachineStatus::Ready)
             && !matches!(self.page, Page::AdminPin | Page::Admin);
-        let page = if machine_unavailable {
+        let payment_setup = self.uses_vendimint()
+            && !matches!(self.payment_status, PaymentStatus::Ready)
+            && !matches!(self.page, Page::AdminPin | Page::Admin);
+        let page = if self.pending_claim.is_some() {
+            self.view_claim_request()
+        } else if payment_setup {
+            self.view_payment_setup()
+        } else if machine_unavailable {
             self.view_machine_unavailable()
         } else {
             match &self.page {
                 Page::Ready => self.view_ready(),
                 Page::PromoEntry(context) => self.view_promo_entry(context),
                 Page::Promo => self.view_promo(),
+                Page::LightningLoading {
+                    transaction_id,
+                    selection,
+                    price,
+                    started,
+                } => self.view_lightning_loading(*transaction_id, selection, *price, *started),
                 Page::Lightning {
                     transaction_id,
                     selection,
-                    price_cents,
+                    price,
                     started,
-                } => self.view_lightning(*transaction_id, selection, *price_cents, *started),
+                    confirming_exit,
+                    qr,
+                } => self.view_lightning(
+                    *transaction_id,
+                    selection,
+                    *price,
+                    *started,
+                    *confirming_exit,
+                    qr,
+                ),
                 Page::Dispensing {
                     transaction_id,
                     selection,
@@ -1348,6 +1886,103 @@ impl KioskApp {
             .height(Length::Fill)
             .padding(18)
             .into()
+    }
+
+    fn view_payment_setup(&self) -> Element<'_, Message> {
+        match &self.payment_status {
+            PaymentStatus::Starting => column![
+                text("Starting secure payments…").size(32),
+                text("The kiosk will continue automatically.").size(18)
+            ]
+            .align_x(iced::Alignment::Center)
+            .spacing(18)
+            .into(),
+            PaymentStatus::Unclaimed {
+                pairing_payload,
+                qr,
+            } => {
+                let visual: Element<'_, Message> = qr.as_ref().map_or_else(
+                    || {
+                        container(text("Pairing QR could not be rendered"))
+                            .width(360)
+                            .height(360)
+                            .center(Length::Fill)
+                            .style(container::warning)
+                            .into()
+                    },
+                    |qr| {
+                        container(qr_code(qr).total_size(340))
+                            .padding(10)
+                            .style(container::rounded_box)
+                            .into()
+                    },
+                );
+                column![
+                    text("Pair this kiosk").size(34),
+                    text("Scan with LightningVEND Manager. A matching confirmation code will appear on both screens.")
+                        .size(17),
+                    visual,
+                    text(format!("Pairing payload ready · {} bytes", pairing_payload.len()))
+                        .size(13)
+                ]
+                .align_x(iced::Alignment::Center)
+                .spacing(16)
+                .into()
+            }
+            PaymentStatus::ClaimedUnconfigured => column![
+                text("Kiosk paired").size(34),
+                text("Waiting for the manager to configure its federation.").size(18)
+            ]
+            .align_x(iced::Alignment::Center)
+            .spacing(18)
+            .into(),
+            PaymentStatus::Unavailable(error) => column![
+                text("Secure payments unavailable").size(32),
+                text(error).size(17),
+                button("Administrator access")
+                    .padding(14)
+                    .style(button::secondary)
+                    .on_press(Message::OpenAdmin)
+            ]
+            .align_x(iced::Alignment::Center)
+            .spacing(20)
+            .into(),
+            PaymentStatus::Simulator | PaymentStatus::Ready => {
+                unreachable!("ready payment state is handled by the normal kiosk view")
+            }
+        }
+    }
+
+    fn view_claim_request(&self) -> Element<'_, Message> {
+        let pin = self
+            .pending_claim
+            .as_ref()
+            .map_or("------", ClaimRequest::pin);
+        column![
+            text("Confirm manager pairing").size(32),
+            text("Verify that this same six-digit code appears in the manager app.").size(18),
+            container(text(pin).size(52))
+                .padding(24)
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .style(container::rounded_box),
+            row![
+                button("Reject")
+                    .padding(18)
+                    .width(Length::Fill)
+                    .style(button::danger)
+                    .on_press(Message::RejectClaim),
+                button("Confirm")
+                    .padding(18)
+                    .width(Length::Fill)
+                    .style(button::success)
+                    .on_press(Message::ConfirmClaim)
+            ]
+            .spacing(14)
+        ]
+        .align_x(iced::Alignment::Center)
+        .spacing(22)
+        .into()
     }
 
     fn view_ready(&self) -> Element<'_, Message> {
@@ -1558,52 +2193,114 @@ impl KioskApp {
         .into()
     }
 
-    fn view_lightning(
+    fn view_lightning_loading(
         &self,
         transaction_id: TransactionId,
         selection: &MachineSelection,
-        price_cents: u32,
+        price: Msats,
         started: Instant,
     ) -> Element<'_, Message> {
         let remaining = LIGHTNING_TIMEOUT
             .saturating_sub(self.now.saturating_duration_since(started))
             .as_secs();
+        let angle =
+            self.now.saturating_duration_since(started).as_secs_f32() * std::f32::consts::TAU / 1.1;
         column![
             row![
                 text(selection.product_name().to_owned())
                     .size(30)
                     .width(Length::Fill),
-                back_button(Message::LightningCancelled(transaction_id))
+                back_button(Message::ConfirmLightningExit(transaction_id))
             ]
             .align_y(iced::Alignment::Center),
             text(format!(
                 "Selection {} · {}",
                 selection.slot(),
-                dollars(price_cents)
+                format_sats(price)
             ))
             .size(19),
+            container(circular_spinner(angle))
+                .width(Length::Fill)
+                .height(330)
+                .center(Length::Fill),
+            text("Creating a Lightning invoice…").size(22),
+            text(format!("{remaining} seconds remaining")).size(18)
+        ]
+        .align_x(iced::Alignment::Center)
+        .spacing(18)
+        .into()
+    }
+
+    fn view_lightning<'a>(
+        &'a self,
+        transaction_id: TransactionId,
+        selection: &'a MachineSelection,
+        price: Msats,
+        started: Instant,
+        confirming_exit: bool,
+        qr: &'a QrData,
+    ) -> Element<'a, Message> {
+        let remaining = LIGHTNING_TIMEOUT
+            .saturating_sub(self.now.saturating_duration_since(started))
+            .as_secs();
+        let action: Element<'_, Message> = if confirming_exit {
             container(
                 column![
-                    text("LIGHTNING QR").size(28),
-                    text("coming in the payment integration milestone")
+                    text("Leave this invoice?").size(22),
+                    text("If you leave, do not pay it. This invoice will never vend an item, even if payment succeeds.")
+                        .size(16),
+                    row![
+                        button("Keep waiting")
+                            .padding(14)
+                            .width(Length::Fill)
+                            .on_press(Message::KeepLightningOpen(transaction_id)),
+                        button("Leave anyway")
+                            .padding(14)
+                            .width(Length::Fill)
+                            .style(button::danger)
+                            .on_press(Message::ConfirmLightningExit(transaction_id))
+                    ]
+                    .spacing(10)
                 ]
-                .align_x(iced::Alignment::Center)
-                .spacing(8)
+                .spacing(10),
             )
-            .width(Length::Fill)
-            .height(300)
-            .center(Length::Fill)
-            .style(container::rounded_box),
+            .padding(14)
+            .style(container::warning)
+            .into()
+        } else if self.uses_vendimint() {
+            container(text("Waiting for payment…").size(20))
+                .padding(16)
+                .width(Length::Fill)
+                .center_x(Length::Fill)
+                .style(container::rounded_box)
+                .into()
+        } else {
+            button("Vend — simulate paid invoice")
+                .padding(16)
+                .width(Length::Fill)
+                .style(button::success)
+                .on_press(Message::LightningAccepted(transaction_id))
+                .into()
+        };
+        column![
+            row![
+                text(selection.product_name().to_owned())
+                    .size(30)
+                    .width(Length::Fill),
+                back_button(Message::RequestLightningExit(transaction_id))
+            ]
+            .align_y(iced::Alignment::Center),
+            text(format!(
+                "Selection {} · {}",
+                selection.slot(),
+                format_sats(price)
+            ))
+            .size(19),
+            container(qr_code(qr).total_size(290))
+                .padding(5)
+                .style(container::rounded_box),
             text(format!("{remaining} seconds remaining")).size(18),
-            button(if self.is_hardware() {
-                "Vend"
-            } else {
-                "Vend — simulate accepted hold invoice"
-            })
-            .padding(16)
-            .width(Length::Fill)
-            .style(button::success)
-            .on_press(Message::LightningAccepted(transaction_id))
+            action
         ]
         .align_x(iced::Alignment::Center)
         .spacing(18)
@@ -1880,8 +2577,8 @@ impl KioskApp {
             .iter()
             .map(|slot| match slot.payment() {
                 PaymentPolicy::Promo => format!("{} · Included with event code", slot.id()),
-                PaymentPolicy::Lightning { price_cents } => {
-                    format!("{} · {}", slot.id(), dollars(price_cents))
+                PaymentPolicy::Lightning { price } => {
+                    format!("{} · {}", slot.id(), format_sats(price))
                 }
             })
             .collect::<Vec<_>>()
@@ -2151,17 +2848,46 @@ fn seconds_until(deadline: Option<Instant>, now: Instant) -> Option<u64> {
     Some(remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0))
 }
 
-fn dollars(cents: u32) -> String {
-    format!("${}.{:02}", cents / 100, cents % 100)
+fn unix_seconds_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
-fn approval_amount(payment: &PaymentKind) -> Result<Level1Amount, String> {
-    let raw = match payment {
-        PaymentKind::Lightning { price_cents } => u16::try_from(price_cents / 10)
-            .map_err(|_| format!("configured Lightning price {price_cents} cents exceeds MDB"))?,
-        PaymentKind::Promo { .. } | PaymentKind::FreeVend | PaymentKind::MaintenanceTest => 0,
-    };
-    Level1Amount::new(raw).map_err(|error| error.to_string())
+fn duration_seconds_ceil(duration: Duration) -> u64 {
+    duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
+}
+
+fn simulated_invoice(transaction_id: TransactionId) -> LightningInvoice {
+    let id = transaction_id.as_uuid().into_bytes();
+    let mut operation_id = [0_u8; 32];
+    operation_id[..16].copy_from_slice(&id);
+    operation_id[16..].copy_from_slice(&id);
+    let mut payment_hash = operation_id;
+    payment_hash.reverse();
+    let now = u64::try_from(chrono::Utc::now().timestamp()).unwrap_or_default();
+    LightningInvoice {
+        bolt11: format!("simulation-{transaction_id}"),
+        operation_id,
+        payment_hash,
+        expires_at_unix_seconds: now.saturating_add(LIGHTNING_TIMEOUT.as_secs()),
+    }
+}
+
+fn format_sats(amount: Msats) -> String {
+    let msats = amount.as_u64();
+    let sats = msats / 1_000;
+    let fractional = msats % 1_000;
+    if fractional == 0 {
+        format!("{sats} sats")
+    } else {
+        format!("{sats}.{fractional:03} sats")
+    }
+}
+
+const fn approval_amount(requested_price: Level1Amount) -> Level1Amount {
+    requested_price
 }
 
 #[cfg(test)]
@@ -2169,20 +2895,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn formats_catalog_prices() {
-        assert_eq!(dollars(250), "$2.50");
-        assert_eq!(dollars(400), "$4.00");
+    fn formats_catalog_prices_in_sats() {
+        assert_eq!(format_sats(Msats::from_msats(250_000)), "250 sats");
+        assert_eq!(format_sats(Msats::from_msats(400_125)), "400.125 sats");
     }
 
     #[test]
-    fn converts_kiosk_policy_to_mdb_approval_amounts() {
-        assert_eq!(
-            approval_amount(&PaymentKind::Lightning { price_cents: 250 })
-                .unwrap()
-                .raw(),
-            25
-        );
-        assert_eq!(approval_amount(&PaymentKind::FreeVend).unwrap().raw(), 0);
+    fn echoes_the_vmc_amount_without_using_it_as_the_lightning_price() {
+        let requested = Level1Amount::new(1_251).unwrap();
+        assert_eq!(approval_amount(requested), requested);
     }
 
     #[test]

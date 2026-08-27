@@ -10,5 +10,11 @@ default:
 
 # Cross-compile the kiosk release binary for a 64-bit Raspberry Pi 5.
 build-pi:
-    cargo zigbuild --locked --release --bin lv-kiosk --target {{ pi-zig-target }}
+    cargo zigbuild --locked --release -p lv-kiosk --bin lv-kiosk --target {{ pi-zig-target }}
     @echo "Built {{ pi-binary }}"
+
+# Check, lint, and test every crate in the workspace.
+check:
+    cargo fmt --all --check
+    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo test --workspace --all-targets --all-features

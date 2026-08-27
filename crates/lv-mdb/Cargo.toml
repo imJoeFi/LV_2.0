@@ -1,0 +1,16 @@
+[package]
+name = "lv-mdb"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+hex.workspace = true
+nix.workspace = true
+tokio.workspace = true
+tokio-serial.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

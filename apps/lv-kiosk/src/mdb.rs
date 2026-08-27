@@ -1,4 +1,4 @@
-use lv_mdb_tools::{
+use lv_mdb::{
     ItemNumber, Level1Amount, MdbConfig, MdbDevice, MdbSession, PendingVend, SessionEndReason,
     SessionEvent, SessionFunds, VendDecisionError, VendId,
 };

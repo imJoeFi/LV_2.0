@@ -1,0 +1,30 @@
+[package]
+name = "lv-vendimint"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bitcoin.workspace = true
+# Vendimint's lockfile pins this compatible pre-release pair. Keeping direct
+# constraints prevents Cargo from selecting the API-incompatible final release.
+ed25519.workspace = true
+fedimint-core.workspace = true
+fedimint-lnv2-common.workspace = true
+fedimint-lnv2-remote-client.workspace = true
+iroh.workspace = true
+lightning-invoice.workspace = true
+libsqlite3-sys.workspace = true
+lv-core.workspace = true
+pkcs8.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Older Iroh networking crates require socket2's gated BSD raw-socket APIs.
+socket2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+vendimint.workspace = true
+
+[lints]
+workspace = true

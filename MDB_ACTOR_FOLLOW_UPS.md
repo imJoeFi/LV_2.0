@@ -91,19 +91,21 @@ behavior, then test representative unexpected commands.
 
 The captured adapter configuration advertises a seven-second application
 maximum response time (`Z7 = 0x07`). The interactive harness configures the
-actor for its 45-second payment window plus one second, but that setter does not
-reprogram the adapter. Reconfigure and recapture the adapter, or constrain the
+actor for a 46-second application response time around the kiosk's 40-second
+payment window, but that setter does not reprogram the adapter. Reconfigure and
+recapture the adapter, or constrain the
 actor to the value actually advertised. The configured and enforced deadlines
 must have a single source of truth.
 
 ### Refund capability and payment durability
 
 The stored miscellaneous-options byte is `0x0D`, which includes the capability
-to restore funds. On `VEND FAILURE`, the actor currently emits an event and
-returns to idle without representing refund-pending, refund-complete, or
-refund-failed state. Either implement and durably coordinate that lifecycle
-with the payment backend, or clear unsupported capabilities in the adapter
-configuration. The adapter's automatic acknowledgement behavior must also be
+to restore funds. Version one instead records a durable staff-assistance case
+for a paid Lightning vend failure and uses an out-of-band operator resolution.
+Clear this unsupported capability in the adapter configuration before real
+money is enabled. If protocol-level refunds are added later, durably coordinate
+refund-pending, refund-complete, and refund-failed states with the payment
+backend. The adapter's automatic acknowledgement behavior must also be
 qualified so the VMC is not told refund handling is complete too early.
 
 ### Session-complete response on real hardware

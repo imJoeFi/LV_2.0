@@ -38,9 +38,15 @@
             packages = [
               rustToolchain
               pkgs.cargo-zigbuild
+              pkgs.clang
+              pkgs.cmake
               pkgs.just
+              pkgs.llvmPackages.libclang
+              pkgs.pkg-config
               pkgs.zig
             ];
+
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
         }
       );

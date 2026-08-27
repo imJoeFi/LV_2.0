@@ -185,7 +185,9 @@ Confirmed end to end: the item dispensed.
 Measured three times by staying silent after `13 00`: **60.066 s, 59.865 s,
 60.065 s.** The VMC then sends `13 03`, followed ~200 ms later by `13 04`.
 
-Answer by **45 s**, not 60. At 60 we raced the machine by 217 ms and sent
+The production kiosk uses a **40 s** customer payment window. Bench testing
+originally used **45 s** as the latest application decision point; at 60 we
+raced the machine by 217 ms and sent
 `06 VEND DENIED` into a session it had already closed.
 
 ### The item field is row/column, not a number

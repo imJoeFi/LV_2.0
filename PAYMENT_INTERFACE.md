@@ -1,151 +1,100 @@
-# Payment interface
+# Lightning payment boundary
 
-The seam between the machine side of LightningVEND and the payment side.
+This document describes the durable seam between the kiosk state actor,
+Vendimint, and MDB. The kiosk is authoritative for inventory and vend safety;
+Vendimint creates and observes Lightning receives and moves completed funds to
+the claimed manager.
 
-The machine side is proven working — see the bench results in
-[`MDB_HACKING.md`](MDB_HACKING.md). It handles the vending machine, the MDB
-session, the timing, and the customer display. It knows nothing about how
-payment happens.
+## Money and price authority
 
-The payment side owns everything else.
+Application money is always an exact integer number of millisatoshis (`Msats`).
+There is no cents or floating-point money type. Catalog prices come only from
+`config/kiosk.toml`, with a current mainnet testing floor of 100,000 msats (100
+sats).
 
----
+The VMC-provided price is deliberately ignored when deciding what the customer
+owes or whether a selection is allowed. Once a vend is authorized, the kiosk
+echoes the VMC's raw requested amount in `VEND APPROVED` solely to satisfy the
+MDB protocol. That value never crosses into the payment domain.
 
-## The contract
+## Payment window
 
-Two calls. That is the whole surface.
+The AP113 ends an unanswered vend request after roughly 60 seconds. The kiosk
+shows a payable invoice for at most 40 seconds, leaving time to persist the
+decision and deny MDB before its deadline. Network and payment observation run
+asynchronously and may never block the MDB actor.
 
-### 1. Create a payment request
+An invoice's payable lifetime must cover the entire interval during which it is
+shown. The kiosk records the authoritative Vendimint operation ID, payment
+hash, invoice, and expiration before displaying the QR.
 
-```
-create(selection, amount) -> { payload, display_amount, id }
-```
+## Durable ordering
 
-| In | |
-|---|---|
-| `selection` | Selection code, e.g. `"A1"` — for display and bookkeeping |
-| `amount` | Price in **dollars**, already converted from MDB units by our side |
+The normal path is:
 
-| Out | |
-|---|---|
-| `payload` | The string to render as a QR on the customer screen |
-| `display_amount` | Optional secondary figure to show, e.g. a sats amount |
-| `id` | Whatever handle `status()` needs |
+1. Validate the physical slot against local catalog, health, and inventory.
+2. Durably create a purchase and reserve one unit of that slot.
+3. Mark invoice creation in progress and request a Vendimint invoice.
+4. Durably record the returned invoice and operation ID.
+5. Display the QR.
+6. Observe Vendimint's authoritative funded result.
+7. Durably mark the purchase `AwaitingVend` before sending MDB approval.
+8. Record success, known failure, or an uncertain vend outcome.
 
-Called the instant the customer presses a selection. **Return fast** — every
-millisecond here comes out of the payment window below.
+The state document is committed atomically to redb at every safety boundary.
+The UI is a projection of durable state, not the owner of payment truth.
 
-### 2. Ask whether it settled
+## Leaving an invoice
 
-```
-status(id) -> "pending" | "settled" | "dead"
-```
+Once an invoice has been displayed, a user may leave after a warning. The kiosk
+then marks the purchase abandoned and releases its inventory reservation so a
+later customer is not blocked. This is a one-way transition: an abandoned
+invoice can never authorize a vend, even if it is funded later.
 
-Polled, non-blocking, roughly every 400 ms.
+The kiosk continues observing the abandoned Vendimint operation until it is
+funded or expires. Expiration closes it normally. Late funding creates a
+staff-assistance record; it does not vend. A small invoice-creation rate limit
+and audit log discourage abuse without allowing abandoned invoices to pin
+inventory.
 
-- `settled` → we send `05 VEND APPROVED` and the machine attempts to dispense
-- `dead` → expired, cancelled, or otherwise unpayable; we release the machine
-- `pending` → keep waiting
+## Vend outcomes after payment
 
-A cancel hook (`cancel(id)`) is useful but optional — we call it when a customer
-walks away or picks something else.
+Lightning is paid before vending; version one does not use hold invoices.
 
----
+- `VEND SUCCESS`: decrement physical inventory and mark the purchase dispensed.
+- Known `VEND FAILURE`: preserve inventory, mark the slot `NeedsAttention`, and
+  tell the customer to find staff for out-of-band assistance/refund.
+- Lost power or an unrecoverably ambiguous outcome after approval: mark the
+  purchase uncertain, preserve inventory, block the slot, and require a manager
+  to determine whether it dispensed.
 
-## The one hard constraint
+The safety bias is to avoid a duplicate vend. A restart never repeats a vend
+whose outcome is unknown.
 
-**The whole payment must complete within 45 seconds** of the customer pressing
-their selection.
+## Vendimint and manager transport
 
-The vending machine gives us 60 seconds between announcing the selection and
-needing an answer — measured three times, dead consistent. We answer at 45 to
-leave margin; at 60 we raced it and lost by 217 ms.
+The kiosk's Vendimint `Machine` owns payment creation/observation. The manager's
+Vendimint `Manager` claims kiosks, sweeps completed receives, and supplies the
+authenticated Iroh identity used by the LightningVEND manager ALPN.
 
-Inside that budget sits everything: creating the request, the customer getting
-their phone out, scanning, confirming, and settlement being *observed* by
-`status()`. So the real user-facing budget is more like 40 seconds.
+`lv-core` owns the serializable purchase states, manager commands/events, and
+versioned wire messages. `lv-vendimint` installs the claimed-manager-only Iroh
+handler and length-delimited request/response framing. The kiosk state actor is
+the only component allowed to apply a manager command or append a manager
+event.
 
-If nothing has settled by then we send `06 VEND DENIED`, the machine resets, and
-the customer is told nothing was charged. That path is tested and clean — the
-machine re-arms for the next person with no intervention.
+## Integration status
 
-**Nothing may block.** `create()` and `status()` run on a worker; the MDB
-deadline timer must never be held up by a slow or hanging network call.
+The kiosk can now opt into a persistent mainnet Vendimint machine. A dedicated
+Tokio actor owns it, creates invoices, observes final funded/expired states,
+forwards authenticated manager requests, and exposes physical claim
+confirmation to Iced. The kiosk renders real invoice and pairing QR codes and
+reattaches watchers for abandoned invoices recovered from redb.
 
----
+The manager UI still needs claim initiation/scanning and command handling. The
+agreed invoice creation rate limit and concurrent abandoned-invoice cap also
+remain before public deployment. Real-money qualification must additionally
+complete the MDB reliability items in `MDB_ACTOR_FOLLOW_UPS.md`.
 
-## Money and rounding
-
-Prices come off the machine as integers that are **not cents**. Our side does
-the conversion and hands you dollars:
-
-    dollars = raw * 10 / 100 = raw / 10
-
-Verified on the bench: we sent `1345` and the machine displayed `$134.50`.
-
-The amount must be honoured **exactly**. The machine is told to vend at the
-price it quoted, so an underpayment cannot be absorbed. If a partial payment is
-possible in your backend, treat it as `pending` until whole, then `dead`.
-
-Note the machine's current prices are unconfigured — a $5.00 minimum and
-$134.50 maximum. They need setting via `SET PRICE` in the service menu before
-any real use. That is a machine configuration job, not a software one.
-
----
-
-## QR constraints
-
-The customer screen is a 720×720 panel over **72.53 mm** of glass, and the QR
-gets a 472 px window inside it. That works out to:
-
-| Payload length | Modules | mm per module |
-|---|---|---|
-| ~270 chars | 49 | 0.97 |
-| ~360 chars | 57 | 0.83 |
-
-Phone cameras start failing around 0.5 mm per module, so there is headroom — but
-not a lot. **Shorter payloads scan better.** If the payload format lets you trim
-a description field or drop an optional parameter, do.
-
-If the payload is case-insensitive, tell us: encoding it uppercase lets the QR
-use alphanumeric mode instead of byte mode, which is roughly 30% denser. That
-alone is worth several modules.
-
----
-
-## What our side guarantees
-
-- A selection is announced exactly once per session
-- `create()` is called at most once per selection, unless the customer changes
-  their mind, in which case the previous one is cancelled first
-- `05 VEND APPROVED` is sent **only** on `settled`, never speculatively
-- The machine is always released, on every path — settled, dead, or timed out
-
-## Failure and refund responsibility
-
-MDB does not move Lightning funds, but it does report whether the product was
-actually dispensed. After `VEND APPROVED`, the payment side must correlate the
-MDB vend ID with its payment ID and handle both outcomes durably:
-
-- `VEND SUCCESS`, or `RESET` after approval → treat the purchase as dispensed
-- `VEND FAILURE` → void an authorization or refund a settled payment
-- `VEND CANCEL` before approval → invalidate the vend and cancel any pending
-  payment request
-
-An authorize/hold followed by capture on vend success is preferable when the
-payment backend supports it. If payment must settle before MDB approval, the
-refund operation must be idempotent and survive a process restart.
-
-Our side does not carry partial payment or credit between sessions.
-
----
-
-## Status
-
-The original synchronous machine flow is **working on real hardware.** Full
-flow was confirmed 2026-08-08 — selection, price, approval, dispense, session
-teardown, re-arm. The Tokio actor refactor has simulated-adapter coverage for
-the Level 1 lifecycle but still requires another hardware qualification pass.
-
-Payment side: not started. `mdb/mdb_flow_test.py` stands in for it with a
-`y`/`n` prompt, which is exactly where `status()` will slot in.
+Longer-term Vendimint maintenance and recovery work is tracked in
+`VENDIMINT_FOLLOW_UPS.md`.

@@ -1,3 +1,4 @@
+use crate::Msats;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -6,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
-const MAX_MDB_PRICE_CENTS: u32 = 0xfffe * 10;
+pub const MIN_LIGHTNING_PRICE: Msats = Msats::from_msats(100_000);
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -101,14 +102,14 @@ impl Product {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaymentPolicy {
     Promo,
-    Lightning { price_cents: u32 },
+    Lightning { price: Msats },
 }
 
 impl PaymentPolicy {
-    pub const fn price_cents(self) -> Option<u32> {
+    pub const fn price(self) -> Option<Msats> {
         match self {
             Self::Promo => None,
-            Self::Lightning { price_cents } => Some(price_cents),
+            Self::Lightning { price } => Some(price),
         }
     }
 }
@@ -185,22 +186,22 @@ impl Catalog {
                     product: product_id,
                 });
             }
-            let payment = match (config.payment, config.price_cents) {
+            let payment = match (config.payment, config.price_msats) {
                 (PaymentConfig::Promo, None) => PaymentPolicy::Promo,
                 (PaymentConfig::Promo, Some(_)) => {
                     return Err(CatalogError::PromoPrice(id));
                 }
-                (PaymentConfig::Lightning, Some(price_cents))
-                    if price_cents > 0
-                        && price_cents <= MAX_MDB_PRICE_CENTS
-                        && price_cents.is_multiple_of(10) =>
+                (PaymentConfig::Lightning, Some(price_msats))
+                    if price_msats >= MIN_LIGHTNING_PRICE.as_u64() =>
                 {
-                    PaymentPolicy::Lightning { price_cents }
+                    PaymentPolicy::Lightning {
+                        price: Msats::from_msats(price_msats),
+                    }
                 }
-                (PaymentConfig::Lightning, Some(price_cents)) => {
+                (PaymentConfig::Lightning, Some(price_msats)) => {
                     return Err(CatalogError::InvalidLightningPrice {
                         slot: id,
-                        price_cents,
+                        price_msats,
                     });
                 }
                 (PaymentConfig::Lightning, None) => {
@@ -268,7 +269,7 @@ struct SlotConfig {
     id: String,
     product: String,
     payment: PaymentConfig,
-    price_cents: Option<u32>,
+    price_msats: Option<u64>,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
 }
@@ -307,14 +308,14 @@ pub enum CatalogError {
     DuplicateSlot(SlotId),
     #[error("slot {slot} refers to unknown product {product}")]
     UnknownProduct { slot: SlotId, product: ProductId },
-    #[error("promo slot {0} must not define a dollar price")]
+    #[error("promo slot {0} must not define a Lightning price")]
     PromoPrice(SlotId),
-    #[error("Lightning slot {0} must define price_cents")]
+    #[error("Lightning slot {0} must define price_msats")]
     MissingLightningPrice(SlotId),
     #[error(
-        "Lightning slot {slot} has invalid price {price_cents}; use a positive multiple of 10 cents no greater than 655340"
+        "Lightning slot {slot} has invalid price {price_msats} msats; the minimum is 100000 msats"
     )]
-    InvalidLightningPrice { slot: SlotId, price_cents: u32 },
+    InvalidLightningPrice { slot: SlotId, price_msats: u64 },
 }
 
 #[cfg(test)]
@@ -344,7 +345,7 @@ mod tests {
         id = "B1"
         product = "snack"
         payment = "lightning"
-        price_cents = 250
+        price_msats = 250000
     "#;
 
     #[test]
@@ -359,14 +360,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lightning_prices_that_mdb_cannot_represent() {
-        let source = CATALOG.replace("price_cents = 250", "price_cents = 255");
-        assert!(matches!(
-            Catalog::parse(&source, Path::new(".")),
-            Err(CatalogError::InvalidLightningPrice { .. })
-        ));
-
-        let source = CATALOG.replace("price_cents = 250", "price_cents = 655350");
+    fn rejects_lightning_prices_below_the_mainnet_floor() {
+        let source = CATALOG.replace("price_msats = 250000", "price_msats = 99999");
         assert!(matches!(
             Catalog::parse(&source, Path::new(".")),
             Err(CatalogError::InvalidLightningPrice { .. })

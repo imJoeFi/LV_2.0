@@ -1,9 +1,10 @@
 # LightningVEND kiosk GUI
 
-The `lv-kiosk` binary is the 480×800 portrait touchscreen application. It can
-run with either its built-in simulator or a live MDB machine. Supplying
-`--port` explicitly enables hardware mode; omitting it is always safe and keeps
-all vending simulated.
+The `lv-kiosk` binary is the 480×800 portrait touchscreen application. MDB and
+Lightning are configured independently: `--port` enables the live vending
+machine, while `--vendimint-data` enables the persistent mainnet payment
+machine. Omitting either option keeps that side simulated, so the command below
+does not create a real invoice or touch vending hardware.
 
 ## Run the simulator
 
@@ -52,8 +53,9 @@ Hardware mode:
 - opens an MDB session with unknown funds and automatically re-arms after every
   completed or cancelled session;
 - maps the AP113 item bytes to catalog slots such as `A1` and `B2`;
-- ignores the price requested by the VMC;
-- approves Lightning vends at the price in `config/kiosk.toml`;
+- ignores the VMC price for catalog, payment, and authorization decisions;
+- echoes the VMC's requested amount only in the MDB approval frame, while the
+  Lightning amount comes exclusively from `config/kiosk.toml`;
 - approves promo, free, and maintenance vends at zero MDB monetary units;
 - saves the transaction or promo reservation before sending `VEND APPROVED`;
 - denies unknown, unavailable, out-of-stock, and unauthorized selections;
@@ -65,9 +67,53 @@ Hardware mode:
 
 The terminal running the GUI prints the raw MDB TX/RX trace for hardware
 debugging. The actor uses a 46-second application response window to support the
-45-second temporary Lightning screen. The adapter's stored MDB configuration
+40-second temporary Lightning screen. The adapter's stored MDB configuration
 must advertise a compatible response time; changing the application setting
 does not reprogram the adapter.
+
+## Enable real Vendimint payments
+
+Pass a dedicated persistent directory to enable Vendimint on Bitcoin mainnet:
+
+```sh
+cargo run --release --bin lv-kiosk -- \
+  --vendimint-data data/vendimint-machine
+```
+
+On a new directory the kiosk displays a pairing QR. The manager initiates a
+Vendimint claim, then a physically present operator compares the six-digit PIN
+on both screens and presses **Confirm** on the kiosk. The kiosk remains in setup
+until the claimed manager supplies a federation configuration. Its Vendimint
+identity and wallet files must be treated as persistent application data and
+must never be shared by two running kiosk processes.
+
+With real payments enabled, the kiosk:
+
+- runs Vendimint on a dedicated Tokio thread and installs the authenticated
+  `lightningvend/manager/1` Iroh protocol on the same endpoint;
+- durably reserves inventory before asking Vendimint for an invoice;
+- durably stores the BOLT11, operation ID, payment hash, and expiration before
+  displaying the QR;
+- waits for Vendimint's funded/expired result instead of showing the simulator
+  vend button;
+- continues observing an abandoned invoice after releasing its inventory;
+- never vends for a late payment to an abandoned invoice; and
+- reattaches payment watchers for unresolved abandoned invoices after restart.
+
+To use real MDB and real Lightning together on the Pi, supply both options:
+
+```sh
+./lv-kiosk \
+  --port /dev/ttyUSB0 \
+  --vendimint-data /var/lib/lightningvend/vendimint \
+  --database /var/lib/lightningvend/lv-kiosk.redb \
+  --catalog /etc/lightningvend/kiosk.toml \
+  --fullscreen
+```
+
+The manager application does not yet implement QR scanning/claim initiation,
+so the kiosk half of this pairing flow is present before the operational
+manager workflow is complete.
 
 ### Promo exercise
 
@@ -79,11 +125,11 @@ does not reprogram the adapter.
 5. Try `VEND FAILURE` to see the reservation released and the slot enter
    **Needs attention**.
 
-### Lightning exercise
+### Simulated Lightning exercise
 
 1. Press simulated `B1` or `B2` before entering a promo code.
-2. The 45-second placeholder payment page appears.
-3. **Vend** simulates an accepted Lightning hold invoice; **Cancel** denies it.
+2. A 40-second simulated invoice QR appears.
+3. **Vend** simulates a paid Lightning invoice; the back arrow abandons it.
 4. Choose the simulated VMC result. A failure preserves inventory and marks the
    slot for attention.
 
@@ -106,14 +152,18 @@ The catalog and mutable machine state are intentionally separate.
 - stable product IDs, display names, and optional image paths;
 - physical slot-to-product assignments;
 - the payment policy for each slot;
-- Lightning prices, in cents and currently restricted to ten-cent increments.
+- Lightning prices as exact integer millisatoshis. The current mainnet testing
+  floor is 100,000 msats (100 sats).
 
 `redb` owns:
 
 - expected per-slot inventory, which defaults to zero;
 - independent slot health (`Ready` or `NeedsAttention`);
 - product-level promo grants, claims, and reservations;
-- transaction history and uncertain results.
+- transaction history and uncertain results;
+- Lightning invoice identity, purchase state, and per-slot inventory
+  reservations; and
+- a schema version around the disposable JSON state document.
 
 `config/promo_codes.csv` grants products rather than slots:
 
@@ -141,7 +191,7 @@ customer promo session
     └── Done / 20 seconds idle: end customer session
 ```
 
-Lightning remains machine-first and has a 45-second decision window because the
+Lightning remains machine-first and has a 40-second decision window because the
 AP113 VMC ends an unanswered vend at about 60 seconds. Promo remains
 screen-first, so authentication and entitlement display happen before a
 physical selection.
@@ -155,8 +205,12 @@ committing to a granular database schema.
 
 On restart:
 
-- an invoice that never reached vend approval becomes cancelled;
-- a transaction that may have been approved becomes uncertain;
+- an invoice which was displayed but not funded becomes abandoned and its
+  inventory reservation is released;
+- that abandoned invoice remains tracked to a final funded/expired state and
+  can never authorize a vend;
+- a late payment on an abandoned invoice becomes a staff-assistance case;
+- a paid transaction interrupted around vend approval becomes uncertain;
 - its slot becomes `NeedsAttention`;
 - a promo reservation remains held for administrator review.
 
@@ -178,7 +232,11 @@ deadline issues in `MDB_ACTOR_FOLLOW_UPS.md` still need resolving.
 
 ## Not implemented yet
 
-- actual Lightning hold invoices and QR generation;
+- QR scanning/claim initiation and the operational manager dashboard;
+- applying manager commands to durable kiosk state and relaying its append-only
+  event log;
+- invoice creation rate limits and a cap on concurrently payable abandoned
+  invoices;
 - production secret handling for the admin PIN;
 - automatic Raspberry Pi startup and display rotation configuration;
 - a promo CSV generation/import utility beyond the parser and sample file;

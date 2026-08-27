@@ -38,10 +38,10 @@ payment = "promo"
 id = "B1"
 product = "trail-mix"
 payment = "lightning"
-price_cents = 250
+price_msats = 250000
 
 [[slots]]
 id = "B2"
 product = "cold-brew"
 payment = "lightning"
-price_cents = 400
+price_msats = 400000

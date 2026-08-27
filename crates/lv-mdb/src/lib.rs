@@ -1,9 +1,8 @@
 #[cfg(not(unix))]
-compile_error!("lv-mdb-tools currently requires a Unix-like operating system");
+compile_error!("lv-mdb currently requires a Unix-like operating system");
 
 mod device;
 mod harness;
-pub mod kiosk;
 mod link;
 mod protocol;
 mod terminal;

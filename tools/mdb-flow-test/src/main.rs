@@ -6,7 +6,7 @@
 //! vends for real.
 
 use clap::Parser;
-use lv_mdb_tools::{Harness, HarnessConfig};
+use lv_mdb::{Harness, HarnessConfig};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

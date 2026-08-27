@@ -1,6 +1,6 @@
-use super::{Catalog, KioskError, PersistentState, ProductId, PromoCode};
+use lv_core::{Catalog, KioskError, PersistentState, ProductId, PromoCode};
 use redb::{Database, ReadableDatabase, TableDefinition};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,13 @@ use thiserror::Error;
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("kiosk_state");
 const STATE_KEY: &str = "persistent_state";
+const STATE_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredState {
+    schema_version: u32,
+    state: PersistentState,
+}
 
 pub struct StateStore {
     database: Database,
@@ -36,10 +43,6 @@ impl StateStore {
         })
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
     pub fn load(&self) -> Result<PersistentState, StoreError> {
         let read = self
             .database
@@ -56,11 +59,23 @@ impl StateStore {
         else {
             return Ok(PersistentState::default());
         };
-        serde_json::from_slice(value.value()).map_err(StoreError::Deserialize)
+        let stored: StoredState =
+            serde_json::from_slice(value.value()).map_err(StoreError::Deserialize)?;
+        if stored.schema_version != STATE_SCHEMA_VERSION {
+            return Err(StoreError::UnsupportedSchemaVersion {
+                found: stored.schema_version,
+                expected: STATE_SCHEMA_VERSION,
+            });
+        }
+        Ok(stored.state)
     }
 
     pub fn save(&self, state: &PersistentState) -> Result<(), StoreError> {
-        let encoded = serde_json::to_vec(state).map_err(StoreError::Serialize)?;
+        let encoded = serde_json::to_vec(&StoredState {
+            schema_version: STATE_SCHEMA_VERSION,
+            state: state.clone(),
+        })
+        .map_err(StoreError::Serialize)?;
         let write = self
             .database
             .begin_write()
@@ -77,7 +92,6 @@ impl StateStore {
     }
 
     pub fn replace_codes_from_csv(
-        &self,
         state: &PersistentState,
         catalog: &Catalog,
         mut reader: impl Read,
@@ -129,6 +143,8 @@ pub enum StoreError {
     Serialize(serde_json::Error),
     #[error("could not decode kiosk state: {0}")]
     Deserialize(serde_json::Error),
+    #[error("unsupported kiosk state schema {found}; this build expects schema {expected}")]
+    UnsupportedSchemaVersion { found: u32, expected: u32 },
     #[error("could not read promo CSV: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid promo CSV: {0}")]
@@ -142,7 +158,7 @@ pub enum StoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kiosk::{Catalog, SlotId};
+    use lv_core::{Catalog, SlotId};
     use std::path::Path;
     use std::str::FromStr;
 
@@ -172,17 +188,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_state_document_from_another_schema_version() {
+        let directory = std::env::temp_dir().join(format!("lv-kiosk-{}", uuid::Uuid::new_v4()));
+        let store = StateStore::open(directory.join("state.redb")).unwrap();
+        let encoded = serde_json::to_vec(&StoredState {
+            schema_version: STATE_SCHEMA_VERSION + 1,
+            state: PersistentState::default(),
+        })
+        .unwrap();
+        let write = store.database.begin_write().unwrap();
+        {
+            let mut table = write.open_table(STATE).unwrap();
+            table.insert(STATE_KEY, encoded.as_slice()).unwrap();
+        }
+        write.commit().unwrap();
+
+        assert!(matches!(
+            store.load(),
+            Err(StoreError::UnsupportedSchemaVersion { .. })
+        ));
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn csv_grants_products_instead_of_slots() {
         let directory = std::env::temp_dir().join(format!("lv-kiosk-{}", uuid::Uuid::new_v4()));
         let store = StateStore::open(directory.join("state.redb")).unwrap();
         let catalog = Catalog::parse(CATALOG, Path::new(".")).unwrap();
-        let state = store
-            .replace_codes_from_csv(
-                &PersistentState::default(),
-                &catalog,
-                "code,product_id,quantity\n123456,water,2\n".as_bytes(),
-            )
-            .unwrap();
+        let state = StateStore::replace_codes_from_csv(
+            &PersistentState::default(),
+            &catalog,
+            "code,product_id,quantity\n123456,water,2\n".as_bytes(),
+        )
+        .unwrap();
         let entitlement = state
             .code(&PromoCode::parse("123456").unwrap())
             .unwrap()
