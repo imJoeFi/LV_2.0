@@ -6945,6 +6945,8 @@ dependencies = [
  "bitcoin",
  "devimint",
  "fedimint-core",
+ "fedimint-lnv2-common",
+ "fedimint-lnv2-remote-client",
  "iroh 0.97.0",
  "lv-core",
  "lv-vendimint",
