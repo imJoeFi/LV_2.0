@@ -842,16 +842,10 @@ impl KioskApp {
             self.last_invalid_code = None;
             self.next_code_attempt = None;
             self.promo_input.clear();
+            self.page = Page::Promo;
             if let Some((request, selection)) = self.take_pending_promo_selection() {
                 let slot = selection.slot().clone();
-                self.page = Page::Promo;
                 self.machine_selected(&slot, request);
-            } else {
-                self.show_transient_notice(
-                    "Code accepted. Choose any included item.",
-                    NoticeSeverity::Info,
-                );
-                self.page = Page::Promo;
             }
         } else {
             self.invalid_code_attempts += 1;
@@ -1048,10 +1042,14 @@ impl KioskApp {
     }
 
     fn lightning_cancelled(&mut self, id: TransactionId) {
-        self.cancel_lightning_with_notice(id, "Lightning payment cancelled.");
+        self.cancel_lightning(id, None);
     }
 
     fn cancel_lightning_with_notice(&mut self, id: TransactionId, notice: &str) {
+        self.cancel_lightning(id, Some(notice));
+    }
+
+    fn cancel_lightning(&mut self, id: TransactionId, notice: Option<&str>) {
         match self.engine.cancel_lightning(id) {
             Ok(()) => {
                 let persisted = self.persist();
@@ -1064,7 +1062,11 @@ impl KioskApp {
                 }
                 self.page = Page::Ready;
                 if persisted {
-                    self.show_transient_notice(notice, NoticeSeverity::Warning);
+                    if let Some(notice) = notice {
+                        self.show_transient_notice(notice, NoticeSeverity::Warning);
+                    } else {
+                        self.notice.clear();
+                    }
                 }
             }
             Err(error) => {
@@ -1361,17 +1363,16 @@ impl KioskApp {
         ]
         .align_y(iced::Alignment::Center);
 
-        let promo = button(
-            column![
-                text("Have an event code?").size(20),
-                text("Enter your six-digit code").size(15)
-            ]
-            .spacing(3),
-        )
-        .padding(16)
-        .width(Length::Fill)
-        .style(button::primary)
-        .on_press(Message::OpenPromo);
+        let promo = column![
+            text("Have an event code?").size(22),
+            button(container(text("Enter your code").size(24)).center(Length::Fill))
+                .height(68)
+                .width(Length::Fill)
+                .padding(0)
+                .style(button::primary)
+                .on_press(Message::OpenPromo)
+        ]
+        .spacing(8);
 
         let catalog = scrollable(self.catalog_grid())
             .id(self.catalog_scroll_id.clone())
@@ -1462,12 +1463,7 @@ impl KioskApp {
             .push(
                 row![
                     text("Enter event code").size(30).width(Length::Fill),
-                    button(container(text("←").size(30)).center(Length::Fill))
-                        .width(58)
-                        .height(48)
-                        .padding(0)
-                        .style(button::secondary)
-                        .on_press(Message::Done)
+                    back_button(Message::Done)
                 ]
                 .align_y(iced::Alignment::Center),
             )
@@ -1573,7 +1569,13 @@ impl KioskApp {
             .saturating_sub(self.now.saturating_duration_since(started))
             .as_secs();
         column![
-            text(selection.product_name().to_owned()).size(30),
+            row![
+                text(selection.product_name().to_owned())
+                    .size(30)
+                    .width(Length::Fill),
+                back_button(Message::LightningCancelled(transaction_id))
+            ]
+            .align_y(iced::Alignment::Center),
             text(format!(
                 "Selection {} · {}",
                 selection.slot(),
@@ -1601,12 +1603,7 @@ impl KioskApp {
             .padding(16)
             .width(Length::Fill)
             .style(button::success)
-            .on_press(Message::LightningAccepted(transaction_id)),
-            button("Cancel")
-                .padding(14)
-                .width(Length::Fill)
-                .style(button::danger)
-                .on_press(Message::LightningCancelled(transaction_id))
+            .on_press(Message::LightningAccepted(transaction_id))
         ]
         .align_x(iced::Alignment::Center)
         .spacing(18)
@@ -1696,12 +1693,7 @@ impl KioskApp {
         column![
             row![
                 text("Administrator access").size(30).width(Length::Fill),
-                button(container(text("←").size(30)).center(Length::Fill))
-                    .width(58)
-                    .height(48)
-                    .padding(0)
-                    .style(button::secondary)
-                    .on_press(Message::CloseAdmin)
+                back_button(Message::CloseAdmin)
             ]
             .align_y(iced::Alignment::Center),
             self.notice_view(),
@@ -2104,6 +2096,16 @@ fn header_action_button(label: &'static str, message: Message) -> Element<'stati
     button(container(text(label).size(20)).center(Length::Fill))
         .width(116)
         .height(60)
+        .padding(0)
+        .style(button::secondary)
+        .on_press(message)
+        .into()
+}
+
+fn back_button(message: Message) -> Element<'static, Message> {
+    button(container(text("←").size(30)).center(Length::Fill))
+        .width(58)
+        .height(48)
         .padding(0)
         .style(button::secondary)
         .on_press(message)
