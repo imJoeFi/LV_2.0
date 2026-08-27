@@ -1,14 +1,20 @@
 use anyhow::{ensure, Context};
-use bitcoin::Network;
+use bitcoin::{hashes::Hash, Network};
 use fedimint_core::{invite_code::InviteCode, Amount};
 use fedimint_lnv2_common::Bolt11InvoiceDescription;
 use fedimint_lnv2_remote_client::FinalRemoteReceiveOperationState;
 use lv_core::{
     Catalog, CommandEnvelope, CommandId, CommandResult, KioskEngine, ManagerCommand, ManagerEvent,
-    ManagerRequest, ManagerResponse, PersistentState, SlotId, StateRevision,
+    ManagerRequest, ManagerResponse, PersistentState, SelectionOutcome, SlotId, StateRevision,
+    TransactionStatus,
 };
 use lv_vendimint::{request, Machine, MachineState, Manager, ManagerProtocolHandler};
-use std::{num::NonZeroUsize, path::Path, str::FromStr, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    path::Path,
+    str::FromStr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::time::{sleep, timeout};
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -49,8 +55,19 @@ async fn main() -> anyhow::Result<()> {
                     machine_ids.len() == 1,
                     "manager did not retain exactly one machine"
                 );
-                exercise_manager_service(&manager, &machine_ids[0], &mut manager_requests).await?;
-                pay_and_sweep(&dev_fed, &machine, &manager, &invite_code).await
+                let mut kiosk =
+                    exercise_manager_service(&manager, &machine_ids[0], &mut manager_requests)
+                        .await?;
+                pay_vend_and_sweep(
+                    &dev_fed,
+                    &machine,
+                    &manager,
+                    &invite_code,
+                    &machine_ids[0],
+                    &mut manager_requests,
+                    &mut kiosk,
+                )
+                .await
             }
             .await;
 
@@ -65,12 +82,35 @@ async fn main() -> anyhow::Result<()> {
     .await
 }
 
-async fn pay_and_sweep(
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn pay_vend_and_sweep(
     dev_fed: &devimint::devfed::DevJitFed,
     machine: &Machine,
     manager: &Manager,
     invite_code: &InviteCode,
+    machine_id: &iroh::EndpointId,
+    manager_requests: &mut lv_vendimint::ManagerRequestReceiver,
+    kiosk: &mut KioskEngine,
 ) -> anyhow::Result<()> {
+    let slot = SlotId::from_str("B1")?;
+    let before_payment = kiosk.manager_snapshot().through_sequence;
+    let SelectionOutcome::LightningPaymentRequired {
+        transaction_id,
+        price,
+        ..
+    } = kiosk.machine_selected(&slot)?
+    else {
+        anyhow::bail!("kiosk did not reserve inventory for the Lightning selection");
+    };
+    ensure!(price.as_u64() == TEST_PAYMENT.msats);
+    kiosk.begin_lightning_invoice(
+        transaction_id,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .saturating_add(PAYMENT_TIMEOUT.as_secs()),
+    )?;
+
     let gateway = dev_fed.gw_ldk().await?;
     let gateway_address: fedimint_core::util::SafeUrl = gateway.addr.parse()?;
     let (invoice, operation_id) = timeout(PAYMENT_TIMEOUT, async {
@@ -95,6 +135,20 @@ async fn pay_and_sweep(
     .await
     .context("timed out waiting for the machine wallet to join the federation")??;
 
+    let expires_at = invoice
+        .expires_at()
+        .context("Vendimint returned an invoice without an expiration")?;
+    kiosk.lightning_invoice_created(
+        transaction_id,
+        lv_core::LightningInvoice {
+            bolt11: invoice.to_string(),
+            operation_id: operation_id.0,
+            payment_hash: invoice.payment_hash().to_byte_array(),
+            expires_at_unix_seconds: expires_at.as_secs(),
+        },
+    )?;
+    ensure!(kiosk.state().reserved_inventory(&slot) == 1);
+
     timeout(
         PAYMENT_TIMEOUT,
         dev_fed.lnd().await?.pay_bolt11_invoice(invoice.to_string()),
@@ -112,6 +166,50 @@ async fn pay_and_sweep(
         payment_state == FinalRemoteReceiveOperationState::Funded,
         "machine reported an unexpected final payment state: {payment_state:?}"
     );
+
+    let approved = kiosk.lightning_payment_accepted(transaction_id)?;
+    ensure!(matches!(approved, SelectionOutcome::VendApproved { .. }));
+    kiosk.vend_succeeded(transaction_id)?;
+    kiosk.synchronize_manager_events();
+    ensure!(kiosk.state().inventory(&slot) == 0);
+    ensure!(
+        kiosk
+            .state()
+            .transactions()
+            .iter()
+            .find(|transaction| transaction.id() == transaction_id)
+            .is_some_and(|transaction| transaction.status() == TransactionStatus::Succeeded),
+        "successful simulated MDB result did not complete the durable transaction"
+    );
+
+    let payment_events = call_manager_service(
+        manager,
+        machine_id,
+        manager_requests,
+        kiosk,
+        ManagerRequest::SubscribeEvents {
+            after: before_payment,
+        },
+    )
+    .await?;
+    let ManagerResponse::Events(payment_events) = payment_events else {
+        anyhow::bail!("manager service did not return post-payment events");
+    };
+    ensure!(payment_events.iter().any(|event| {
+        matches!(
+            &event.event,
+            ManagerEvent::PurchaseChanged(purchase)
+                if purchase.id == transaction_id
+                    && purchase.state == lv_core::PurchaseSummaryState::Dispensed
+        )
+    }));
+    ensure!(payment_events.iter().any(|event| {
+        matches!(
+            &event.event,
+            ManagerEvent::InventorySet { slot, quantity }
+                if slot.as_str() == "B1" && *quantity == 0
+        )
+    }));
 
     let swept = timeout(PAYMENT_TIMEOUT, async {
         loop {
@@ -197,11 +295,12 @@ async fn wait_for_claimed_machine(manager: &Manager) -> anyhow::Result<Vec<iroh:
     .context("timed out waiting for the claimed machine to sync to the manager")?
 }
 
+#[allow(clippy::too_many_lines)]
 async fn exercise_manager_service(
     manager: &Manager,
     machine_id: &iroh::EndpointId,
     requests: &mut lv_vendimint::ManagerRequestReceiver,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<KioskEngine> {
     let catalog = Catalog::parse(
         r#"
             [[products]]
@@ -212,6 +311,16 @@ async fn exercise_manager_service(
             id = "A1"
             product = "water"
             payment = "promo"
+
+            [[products]]
+            id = "snack"
+            name = "Test Snack"
+
+            [[slots]]
+            id = "B1"
+            product = "snack"
+            payment = "lightning"
+            price_msats = 100000
         "#,
         Path::new("."),
     )?;
@@ -254,6 +363,26 @@ async fn exercise_manager_service(
     let repeated = call_manager_service(manager, machine_id, requests, &mut kiosk, command).await?;
     ensure!(repeated == applied, "command retry was not idempotent");
 
+    let stock_lightning = ManagerRequest::Command(CommandEnvelope {
+        id: CommandId::new(),
+        command: ManagerCommand::SetInventory {
+            slot: SlotId::from_str("B1")?,
+            quantity: 1,
+            expected_revision: StateRevision(1),
+        },
+    });
+    let stocked =
+        call_manager_service(manager, machine_id, requests, &mut kiosk, stock_lightning).await?;
+    ensure!(matches!(
+        stocked,
+        ManagerResponse::CommandResult {
+            result: CommandResult::Applied {
+                revision: StateRevision(2)
+            },
+            ..
+        }
+    ));
+
     let events = call_manager_service(
         manager,
         machine_id,
@@ -267,16 +396,17 @@ async fn exercise_manager_service(
     let ManagerResponse::Events(events) = events else {
         anyhow::bail!("manager service did not return its event stream");
     };
-    ensure!(matches!(
-        events.as_slice(),
-        [event]
-            if matches!(
-                &event.event,
-                ManagerEvent::InventorySet { slot, quantity }
-                    if slot.as_str() == "A1" && *quantity == 7
-            )
-    ));
-    Ok(())
+    ensure!(events.iter().any(|event| matches!(
+        &event.event,
+        ManagerEvent::InventorySet { slot, quantity }
+            if slot.as_str() == "A1" && *quantity == 7
+    )));
+    ensure!(events.iter().any(|event| matches!(
+        &event.event,
+        ManagerEvent::InventorySet { slot, quantity }
+            if slot.as_str() == "B1" && *quantity == 1
+    )));
+    Ok(kiosk)
 }
 
 async fn call_manager_service(

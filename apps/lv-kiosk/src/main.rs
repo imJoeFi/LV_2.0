@@ -2,7 +2,7 @@ mod mdb;
 mod notice;
 mod store;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use iced::widget::{
     button, column, container, image, mouse_area, operation, progress_bar, rich_text, row,
     scrollable, span, text, Column, Id, Row,
@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use store::StateStore;
 
 const CUSTOMER_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+const ADMIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const LIGHTNING_TIMEOUT: Duration = Duration::from_secs(40);
 const RATE_LIMIT_RESET: Duration = Duration::from_secs(60);
 const RATE_LIMIT_DELAY: Duration = Duration::from_secs(3);
@@ -40,7 +41,7 @@ const MDB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
-#[command(about = "Portrait LightningVEND kiosk UI")]
+#[command(about = "720×720 LightningVEND kiosk UI")]
 struct Args {
     /// Serial port connected to the WAFER RS232-MDB adapter. Omit for simulation mode.
     #[arg(long, value_name = "PATH")]
@@ -70,17 +71,45 @@ struct Args {
     #[arg(long)]
     seed_demo: bool,
 
-    /// Start as a borderless fullscreen kiosk instead of a 480x800 development window.
+    /// Start as a borderless fullscreen kiosk instead of a 720x720 development window.
     #[arg(long)]
     fullscreen: bool,
 
     /// Optional bootstrap admin PIN. A paired manager can set the initial PIN remotely.
     #[arg(long)]
     admin_pin: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Validate or transactionally replace all promo-code entitlements.
+    ImportPromoCodes {
+        /// CSV containing `code`, `product_id`, and `quantity` columns.
+        #[arg(long, value_name = "PATH")]
+        file: PathBuf,
+
+        /// Validate and summarize the CSV without changing the database.
+        #[arg(long, conflicts_with = "yes")]
+        dry_run: bool,
+
+        /// Confirm replacement of every existing promo entitlement.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> iced::Result {
     let args = Args::parse();
+    if let Some(command) = &args.command {
+        if let Err(error) = run_operator_command(&args, command) {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return Ok(());
+    }
     let fullscreen = args.fullscreen;
     let boot_args = args;
     iced::application(
@@ -92,13 +121,53 @@ fn main() -> iced::Result {
     .theme(Theme::Dark)
     .title("LightningVEND kiosk")
     .window(window::Settings {
-        size: Size::new(480.0, 800.0),
+        size: Size::new(720.0, 720.0),
         fullscreen,
         decorations: !fullscreen,
         resizable: false,
         ..window::Settings::default()
     })
     .run()
+}
+
+fn run_operator_command(args: &Args, command: &Command) -> Result<(), String> {
+    match command {
+        Command::ImportPromoCodes { file, dry_run, yes } => {
+            if !dry_run && !yes {
+                return Err(
+                    "promo import changes the database; pass --dry-run to validate or --yes to replace all entitlements"
+                        .to_owned(),
+                );
+            }
+            let catalog = Catalog::load(&args.catalog).map_err(|error| error.to_string())?;
+            let input = File::open(file)
+                .map_err(|error| format!("could not open promo CSV {}: {error}", file.display()))?;
+            let current = if *dry_run {
+                lv_core::PersistentState::default()
+            } else {
+                StateStore::open(&args.database)
+                    .and_then(|store| store.load())
+                    .map_err(|error| error.to_string())?
+            };
+            let replacement = StateStore::replace_codes_from_csv(&current, &catalog, input)
+                .map_err(|error| error.to_string())?;
+            let summary = format!(
+                "validated {} promo codes with {} product entitlements",
+                replacement.promo_code_count(),
+                replacement.promo_entitlement_count()
+            );
+            if *dry_run {
+                println!("{summary}; database unchanged");
+            } else {
+                let store = StateStore::open(&args.database).map_err(|error| error.to_string())?;
+                store
+                    .save(&replacement)
+                    .map_err(|error| error.to_string())?;
+                println!("{summary}; replaced all previous promo entitlements");
+            }
+            Ok(())
+        }
+    }
 }
 
 enum ApplicationState {
@@ -168,13 +237,13 @@ struct KioskApp {
     payment_status: PaymentStatus,
     pending_claim: Option<ClaimRequest>,
     active_mdb_vend: Option<ActiveMdbVend>,
-    bootstrap_admin_pin: Option<String>,
     page: Page,
     promo_input: String,
     admin_input: String,
     notice: NoticeBanner,
     now: Instant,
     last_customer_activity: Instant,
+    last_admin_activity: Instant,
     invalid_code_attempts: u32,
     last_invalid_code: Option<Instant>,
     next_code_attempt: Option<Instant>,
@@ -281,6 +350,11 @@ enum Page {
         confirming_exit: bool,
         qr: QrData,
     },
+    LightningLimited {
+        slot: SlotId,
+        reason: String,
+        retry_at_unix_millis: u64,
+    },
     Dispensing {
         transaction_id: TransactionId,
         selection: MachineSelection,
@@ -332,6 +406,7 @@ enum Message {
     RequestLightningExit(TransactionId),
     KeepLightningOpen(TransactionId),
     ConfirmLightningExit(TransactionId),
+    DismissLightningLimit,
     SimulatedVend(TransactionId, SimulatedVendResult),
     DismissResult(Destination),
     ArmFreeVend,
@@ -347,9 +422,13 @@ enum Message {
 
 impl KioskApp {
     fn boot(args: &Args) -> Result<Self, String> {
-        if let Some(pin) = &args.admin_pin {
-            lv_core::AdminPin::parse(pin.clone()).map_err(|error| error.to_string())?;
-        }
+        let bootstrap_admin_pin = args
+            .admin_pin
+            .clone()
+            .or_else(|| args.seed_demo.then(|| "2468".to_owned()))
+            .map(lv_core::AdminPin::parse)
+            .transpose()
+            .map_err(|error| error.to_string())?;
         let catalog = Catalog::load(&args.catalog).map_err(|error| error.to_string())?;
         let store = StateStore::open(&args.database).map_err(|error| error.to_string())?;
         let mut state = store.load().map_err(|error| error.to_string())?;
@@ -365,6 +444,13 @@ impl KioskApp {
             for slot in catalog.slots() {
                 state.set_inventory(slot.id().clone(), 3);
                 state.set_health(slot.id().clone(), SlotHealth::Ready);
+            }
+        }
+        if !state.admin_pin_configured() {
+            if let Some(pin) = &bootstrap_admin_pin {
+                state
+                    .configure_admin_pin(pin)
+                    .map_err(|error| error.to_string())?;
             }
         }
         let mut engine = KioskEngine::new(catalog, state);
@@ -414,10 +500,6 @@ impl KioskApp {
             payment_status,
             pending_claim: None,
             active_mdb_vend: None,
-            bootstrap_admin_pin: args
-                .admin_pin
-                .clone()
-                .or_else(|| args.seed_demo.then(|| "2468".to_owned())),
             page: Page::Ready,
             promo_input: String::new(),
             admin_input: String::new(),
@@ -431,6 +513,7 @@ impl KioskApp {
             })),
             now,
             last_customer_activity: now,
+            last_admin_activity: now,
             invalid_code_attempts: 0,
             last_invalid_code: None,
             next_code_attempt: None,
@@ -475,16 +558,8 @@ impl KioskApp {
             Message::SubmitPromo => self.submit_promo_code(),
             Message::Done => self.finish_customer_session(false),
             Message::OpenAdmin => self.open_admin(),
-            Message::AdminDigit(digit) => {
-                if self.admin_input.len() < 12 {
-                    self.admin_input.push(digit);
-                    self.notice.clear();
-                }
-            }
-            Message::AdminBackspace => {
-                self.admin_input.pop();
-                self.notice.clear();
-            }
+            Message::AdminDigit(digit) => self.admin_digit(digit),
+            Message::AdminBackspace => self.admin_backspace(),
             Message::SubmitAdmin => self.submit_admin_pin(),
             Message::CloseAdmin => self.close_admin(),
             Message::MachineSelected(slot) => self.machine_selected(&slot, None),
@@ -492,6 +567,11 @@ impl KioskApp {
             Message::RequestLightningExit(id) => self.request_lightning_exit(id),
             Message::KeepLightningOpen(id) => self.keep_lightning_open(id),
             Message::ConfirmLightningExit(id) => self.lightning_cancelled(id),
+            Message::DismissLightningLimit => {
+                self.page = Page::Ready;
+                self.notice.clear();
+                self.record_customer_activity();
+            }
             Message::SimulatedVend(id, result) => self.simulated_vend(id, result),
             Message::DismissResult(destination) => {
                 self.page = match destination {
@@ -502,33 +582,19 @@ impl KioskApp {
                 self.notice.clear();
                 self.record_customer_activity();
             }
-            Message::ArmFreeVend => {
-                self.engine.arm_free_vend();
-                self.persist();
-                self.show_transient_notice(
-                    "Free vend armed for the next configured, available selection.",
-                    NoticeSeverity::Info,
-                );
+            Message::ArmFreeVend => self.arm_free_vend(),
+            Message::Disarm => self.disarm_vend(),
+            Message::ArmMaintenance(slot) => self.arm_maintenance(&slot),
+            Message::InventoryChange(slot, change) => {
+                self.record_admin_activity();
+                self.change_inventory(slot, change);
             }
-            Message::Disarm => {
-                self.engine.disarm();
-                self.persist();
-                self.show_transient_notice("Vend authorization disarmed.", NoticeSeverity::Info);
+            Message::MarkSlotResolved(slot) => {
+                self.record_admin_activity();
+                self.mark_slot_resolved(slot);
             }
-            Message::ArmMaintenance(slot) => {
-                if let Err(error) = self.engine.arm_maintenance_test(slot.clone()) {
-                    self.show_transient_notice(error.to_string(), NoticeSeverity::Warning);
-                } else {
-                    self.persist();
-                    self.show_transient_notice(
-                        format!("Maintenance test armed. Enter {slot} on the vending machine."),
-                        NoticeSeverity::Info,
-                    );
-                }
-            }
-            Message::InventoryChange(slot, change) => self.change_inventory(slot, change),
-            Message::MarkSlotResolved(slot) => self.mark_slot_resolved(slot),
             Message::ResolveUncertain(id, dispensed) => {
+                self.record_admin_activity();
                 self.resolve_uncertain(id, dispensed);
             }
             Message::CatalogPointerMoved(_)
@@ -552,6 +618,7 @@ impl KioskApp {
                     }),
             ),
             Message::CatalogPointerPressed => {
+                self.record_customer_activity();
                 self.catalog_drag.press();
                 Some(Task::none())
             }
@@ -1123,6 +1190,15 @@ impl KioskApp {
         if self.expire_pending_promo_selection() {
             return;
         }
+        self.update_access_lockouts(now);
+        if self.expire_idle_page(now) {
+            return;
+        }
+        self.expire_lightning_page(now);
+        self.refresh_lightning_limit();
+    }
+
+    fn update_access_lockouts(&mut self, now: Instant) {
         if self
             .next_code_attempt
             .is_some_and(|deadline| now >= deadline)
@@ -1155,15 +1231,34 @@ impl KioskApp {
             self.last_invalid_code = None;
             self.next_code_attempt = None;
         }
+    }
 
-        if self.engine.active_code().is_some()
-            && !matches!(self.page, Page::Dispensing { .. })
+    fn expire_idle_page(&mut self, now: Instant) -> bool {
+        let idle_customer_page = matches!(
+            self.page,
+            Page::PromoEntry(_) | Page::Promo | Page::Result { .. } | Page::LightningLimited { .. }
+        );
+        if idle_customer_page
             && now.saturating_duration_since(self.last_customer_activity) >= CUSTOMER_IDLE_TIMEOUT
         {
             self.finish_customer_session(true);
-            return;
+            return true;
         }
 
+        if matches!(self.page, Page::AdminPin | Page::Admin)
+            && now.saturating_duration_since(self.last_admin_activity) >= ADMIN_IDLE_TIMEOUT
+        {
+            self.close_admin();
+            self.show_transient_notice(
+                "Admin session ended after two minutes of inactivity.",
+                NoticeSeverity::Info,
+            );
+            return true;
+        }
+        false
+    }
+
+    fn expire_lightning_page(&mut self, now: Instant) {
         let expired_lightning = match &self.page {
             Page::LightningLoading {
                 transaction_id,
@@ -1186,6 +1281,23 @@ impl KioskApp {
                 "Lightning payment timed out. No payment was taken."
             };
             self.cancel_lightning_with_notice(id, notice);
+        }
+    }
+
+    fn refresh_lightning_limit(&mut self) {
+        let lightning_limit_cleared = match &self.page {
+            Page::LightningLimited { slot, .. } => self
+                .engine
+                .lightning_limit_for_slot(slot, unix_millis_now())
+                .is_ok_and(|limit| limit.is_none()),
+            _ => false,
+        };
+        if lightning_limit_cleared {
+            self.page = Page::Ready;
+            self.show_transient_notice(
+                "Lightning purchasing is available again.",
+                NoticeSeverity::Info,
+            );
         }
     }
 
@@ -1240,6 +1352,7 @@ impl KioskApp {
     }
 
     fn submit_admin_pin(&mut self) {
+        self.record_admin_activity();
         if self
             .admin_locked_until
             .is_some_and(|until| self.now < until)
@@ -1250,20 +1363,25 @@ impl KioskApp {
             );
             return;
         }
-        let Some(expected_pin) = self.configured_admin_pin() else {
+        if !self.engine.state().admin_pin_configured() {
             self.admin_input.clear();
             self.show_transient_notice(
                 "Admin access will be available after the manager sets an initial PIN.",
                 NoticeSeverity::Warning,
             );
             return;
-        };
-        if self.admin_input == expected_pin {
+        }
+        let candidate = lv_core::AdminPin::parse(self.admin_input.clone());
+        if candidate
+            .as_ref()
+            .is_ok_and(|pin| self.engine.state().verify_admin_pin(pin))
+        {
             self.invalid_admin_attempts = 0;
             self.admin_locked_until = None;
             self.admin_input.clear();
             self.notice.clear();
             self.page = Page::Admin;
+            self.record_admin_activity();
         } else {
             self.invalid_admin_attempts += 1;
             self.admin_input.clear();
@@ -1281,6 +1399,50 @@ impl KioskApp {
         }
     }
 
+    fn admin_digit(&mut self, digit: char) {
+        self.record_admin_activity();
+        if self.admin_input.len() < 12 {
+            self.admin_input.push(digit);
+            self.notice.clear();
+        }
+    }
+
+    fn admin_backspace(&mut self) {
+        self.record_admin_activity();
+        self.admin_input.pop();
+        self.notice.clear();
+    }
+
+    fn arm_free_vend(&mut self) {
+        self.record_admin_activity();
+        self.engine.arm_free_vend();
+        self.persist();
+        self.show_transient_notice(
+            "Free vend armed for the next configured, available selection.",
+            NoticeSeverity::Info,
+        );
+    }
+
+    fn disarm_vend(&mut self) {
+        self.record_admin_activity();
+        self.engine.disarm();
+        self.persist();
+        self.show_transient_notice("Vend authorization disarmed.", NoticeSeverity::Info);
+    }
+
+    fn arm_maintenance(&mut self, slot: &SlotId) {
+        self.record_admin_activity();
+        if let Err(error) = self.engine.arm_maintenance_test(slot.clone()) {
+            self.show_transient_notice(error.to_string(), NoticeSeverity::Warning);
+        } else {
+            self.persist();
+            self.show_transient_notice(
+                format!("Maintenance test armed. Enter {slot} on the vending machine."),
+                NoticeSeverity::Info,
+            );
+        }
+    }
+
     fn close_admin(&mut self) {
         self.engine.disarm();
         self.persist();
@@ -1289,7 +1451,7 @@ impl KioskApp {
     }
 
     fn open_admin(&mut self) {
-        if self.configured_admin_pin().is_none() {
+        if !self.engine.state().admin_pin_configured() {
             self.show_transient_notice(
                 "Pair this kiosk with its manager to configure admin access.",
                 NoticeSeverity::Warning,
@@ -1299,14 +1461,7 @@ impl KioskApp {
         self.admin_input.clear();
         self.notice.clear();
         self.page = Page::AdminPin;
-    }
-
-    fn configured_admin_pin(&self) -> Option<&str> {
-        self.engine
-            .state()
-            .admin_pin()
-            .map(lv_core::AdminPin::expose)
-            .or(self.bootstrap_admin_pin.as_deref())
+        self.record_admin_activity();
     }
 
     fn finish_customer_session(&mut self, timed_out: bool) {
@@ -1321,7 +1476,7 @@ impl KioskApp {
             self.promo_input.clear();
             if timed_out && persisted {
                 self.show_transient_notice(
-                    "Promo session ended after 20 seconds of inactivity.",
+                    "Session ended after 20 seconds of inactivity.",
                     NoticeSeverity::Info,
                 );
             }
@@ -1330,6 +1485,21 @@ impl KioskApp {
 
     fn machine_selected(&mut self, slot: &SlotId, mdb_request: Option<MdbVendRequest>) {
         self.record_customer_activity();
+        if let Ok(Some(limit)) = self
+            .engine
+            .lightning_limit_for_slot(slot, unix_millis_now())
+        {
+            if let Some(request) = mdb_request {
+                self.deny_mdb(request.vend_id);
+            }
+            self.notice.clear();
+            self.page = Page::LightningLimited {
+                slot: slot.clone(),
+                reason: limit.message().to_owned(),
+                retry_at_unix_millis: limit.retry_at_unix_millis(),
+            };
+            return;
+        }
         match self.engine.machine_selected(slot) {
             Ok(SelectionOutcome::PromoCodeRequired { selection }) => {
                 self.promo_input.clear();
@@ -1881,6 +2051,10 @@ impl KioskApp {
         self.last_customer_activity = self.now;
     }
 
+    fn record_admin_activity(&mut self) {
+        self.last_admin_activity = self.now;
+    }
+
     fn show_transient_notice(&mut self, message: impl Into<String>, severity: NoticeSeverity) {
         self.show_transient_notice_for(message, severity, TRANSIENT_NOTICE_DURATION);
     }
@@ -1938,6 +2112,11 @@ impl KioskApp {
                     *confirming_exit,
                     qr,
                 ),
+                Page::LightningLimited {
+                    reason,
+                    retry_at_unix_millis,
+                    ..
+                } => Self::view_lightning_limited(reason, *retry_at_unix_millis),
                 Page::Dispensing {
                     transaction_id,
                     selection,
@@ -2376,6 +2555,41 @@ impl KioskApp {
         ]
         .align_x(iced::Alignment::Center)
         .spacing(18)
+        .into()
+    }
+
+    fn view_lightning_limited(reason: &str, retry_at_unix_millis: u64) -> Element<'_, Message> {
+        let remaining = retry_at_unix_millis
+            .saturating_sub(unix_millis_now())
+            .div_ceil(1_000);
+        column![
+            row![
+                text("Lightning is temporarily unavailable")
+                    .size(32)
+                    .width(Length::Fill),
+                back_button(Message::DismissLightningLimit)
+            ]
+            .align_y(iced::Alignment::Center),
+            text(reason.to_owned()).size(21),
+            text(format!(
+                "Try again in {remaining} second{}.",
+                if remaining == 1 { "" } else { "s" }
+            ))
+            .size(30),
+            progress_bar(
+                0.0..=60.0,
+                f32::from(
+                    u16::try_from(60_u64.saturating_sub(remaining.min(60)))
+                        .expect("countdown progress is at most sixty")
+                )
+            ),
+            button("Return home")
+                .padding(18)
+                .width(Length::Fill)
+                .on_press(Message::DismissLightningLimit)
+        ]
+        .align_x(iced::Alignment::Center)
+        .spacing(24)
         .into()
     }
 

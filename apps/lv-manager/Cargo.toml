@@ -11,9 +11,13 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 iced.workspace = true
+image.workspace = true
 iroh.workspace = true
 lv-core.workspace = true
 lv-vendimint.workspace = true
+nokhwa.workspace = true
+rqrr.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

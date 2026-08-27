@@ -8,8 +8,8 @@ integration, and the two Iced applications can evolve independently.
 | `lv-core` | Catalog, exact `Msats`, inventory/entitlements, durable purchases, and manager command/event wire types |
 | `lv-mdb` | MDB Level 1 protocol, serial transport, typed session ownership, and the test harness |
 | `lv-vendimint` | Vendimint identity/payment facade and authenticated Iroh manager RPC framing |
-| `lv-kiosk` | Portrait customer/admin Iced UI, redb persistence, and orchestration of the state-owning actors |
-| `lv-manager` | Landscape manager Iced application (initial shell) |
+| `lv-kiosk` | 720×720 customer/admin Iced UI, redb persistence, and orchestration of the state-owning actors |
+| `lv-manager` | Resizable landscape manager Iced application for pairing, operations, and funds export |
 | `mdb-flow-test` | Hardware qualification utility |
 | `lv-e2e-tests` | Opt-in regtest system tests for Fedimint, Vendimint pairing, and the manager ALPN |
 
@@ -62,7 +62,7 @@ repeats an uncertain vend.
 ## Manager relationship
 
 Vendimint owns the persistent Iroh identities and machine-claim relationship.
-The kiosk registers `lightningvend/manager/1` as an additional protocol that
+The kiosk registers `lightningvend/manager/2` as an additional protocol that
 Vendimint exposes only to the manager which claimed that machine. The manager
 connects with that same authenticated identity.
 
@@ -77,3 +77,12 @@ Initial pairing displays a kiosk claim QR without requiring an admin PIN. The
 manager and physically present kiosk operator compare/confirm Vendimint's claim
 PIN. After the claim, the manager sets the kiosk name and initial admin PIN.
 Only the same claimed manager may change that PIN remotely.
+
+The PIN crosses the authenticated, encrypted manager connection only while a
+set/change command is applied. The kiosk immediately derives a salted Argon2id
+verifier and persists only that verifier. Command results do not retain the raw
+PIN.
+
+The manager polls wallet balance and per-kiosk snapshots alongside ordered
+events. Funds export spends local notes into a self-contained out-of-band ecash
+token with a 24-hour automatic reclaim timeout if nobody claims it.

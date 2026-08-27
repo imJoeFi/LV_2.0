@@ -57,6 +57,13 @@ staff-assistance record; it does not vend. A small invoice-creation rate limit
 and audit log discourage abuse without allowing abandoned invoices to pin
 inventory.
 
+The concrete version-one limits are six invoice requests per rolling minute,
+three concurrently payable abandoned invoices for one product, and ten across
+the kiosk. Purchase history is the durable audit trail. Reaching a limit denies
+the physical vend request immediately, leaves inventory untouched, and shows a
+retry countdown. Final funding or expiration removes an abandoned invoice from
+the concurrent cap.
+
 ## Vend outcomes after payment
 
 Lightning is paid before vending; version one does not use hold invoices.
@@ -91,10 +98,17 @@ forwards authenticated manager requests, and exposes physical claim
 confirmation to Iced. The kiosk renders real invoice and pairing QR codes and
 reattaches watchers for abandoned invoices recovered from redb.
 
-The manager UI still needs claim initiation/scanning and command handling. The
-agreed invoice creation rate limit and concurrent abandoned-invoice cap also
-remain before public deployment. Real-money qualification must additionally
-complete the MDB reliability items in `MDB_ACTOR_FOLLOW_UPS.md`.
+The resizable manager UI implements camera scanning with paste fallback,
+physical claim confirmation, federation and connection status, durable remote
+commands, append-only event catch-up, wallet balance, and confirmed bearer
+ecash export. The kiosk implements the agreed durable invoice limits and stores
+only an Argon2id verifier for its admin PIN.
+
+The opt-in regtest acceptance scenario covers pairing, authenticated manager
+RPC, a real 100-sat payment, durable inventory reservation, a simulated MDB
+success, manager event delivery, and the completed-payment sweep. Real-money
+qualification must additionally complete the physical MDB reliability items in
+`MDB_ACTOR_FOLLOW_UPS.md`.
 
 Longer-term Vendimint maintenance and recovery work is tracked in
 `VENDIMINT_FOLLOW_UPS.md`.

@@ -143,7 +143,9 @@ impl KioskEngine {
                         "the initial admin PIN has already been configured",
                     ));
                 }
-                self.state.manager.admin_pin = Some(pin);
+                self.state
+                    .configure_admin_pin(&pin)
+                    .map_err(ManagerCommandError::from)?;
                 events.push(ManagerEvent::AdminPinChanged);
             }
             ManagerCommand::ChangeAdminPin { pin } => {
@@ -153,7 +155,9 @@ impl KioskEngine {
                         "set the initial admin PIN before changing it",
                     ));
                 }
-                self.state.manager.admin_pin = Some(pin);
+                self.state
+                    .configure_admin_pin(&pin)
+                    .map_err(ManagerCommandError::from)?;
                 events.push(ManagerEvent::AdminPinChanged);
             }
             ManagerCommand::SetInventory {
@@ -553,7 +557,12 @@ mod tests {
             ),
             CommandResult::Rejected { ref code, .. } if code == "admin_pin_already_set"
         ));
-        assert_eq!(engine.state.admin_pin().unwrap().expose(), "1234");
+        assert!(engine
+            .state
+            .verify_admin_pin(&AdminPin::parse("1234").unwrap()));
+        assert!(!engine
+            .state
+            .verify_admin_pin(&AdminPin::parse("9999").unwrap()));
     }
 
     #[test]

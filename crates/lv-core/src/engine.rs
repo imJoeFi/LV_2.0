@@ -2,8 +2,14 @@ use super::{
     AdminPin, AssistanceReason, AssistanceResolution, Catalog, CommandId, CommandResult,
     EventEnvelope, EventSequence, FreeVendScope, LightningInvoice, LightningPurchase,
     LightningPurchaseState, Msats, PaymentPolicy, ProductId, PurchaseId, PurchaseSummary, SlotId,
-    StateRevision,
+    StateRevision, LIGHTNING_INVOICE_RATE_WINDOW_MILLIS, MAX_LIGHTNING_INVOICES_PER_WINDOW,
+    MAX_PAYABLE_ABANDONED_KIOSK_WIDE, MAX_PAYABLE_ABANDONED_PER_PRODUCT,
 };
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
+use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -243,12 +249,41 @@ struct ManagerProjection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ManagerState {
     name: Option<String>,
-    admin_pin: Option<AdminPin>,
+    admin_pin: Option<AdminPinVerifier>,
     revision: StateRevision,
     through_sequence: EventSequence,
     events: Vec<EventEnvelope>,
     command_results: BTreeMap<CommandId, CommandResult>,
     projection: ManagerProjection,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+struct AdminPinVerifier(String);
+
+impl fmt::Debug for AdminPinVerifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AdminPinVerifier([REDACTED])")
+    }
+}
+
+impl AdminPinVerifier {
+    fn create(pin: &AdminPin) -> Result<Self, KioskError> {
+        let salt = SaltString::generate(&mut OsRng);
+        let encoded = Argon2::default()
+            .hash_password(pin.expose().as_bytes(), &salt)
+            .map_err(|error| KioskError::AdminPinHash(error.to_string()))?
+            .to_string();
+        Ok(Self(encoded))
+    }
+
+    fn verify(&self, candidate: &AdminPin) -> bool {
+        PasswordHash::new(&self.0).is_ok_and(|hash| {
+            Argon2::default()
+                .verify_password(candidate.expose().as_bytes(), &hash)
+                .is_ok()
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +330,17 @@ impl PersistentState {
         self.codes.clear();
     }
 
+    pub fn promo_code_count(&self) -> usize {
+        self.codes.len()
+    }
+
+    pub fn promo_entitlement_count(&self) -> usize {
+        self.codes
+            .values()
+            .map(|account| account.entitlements.len())
+            .sum()
+    }
+
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
     }
@@ -311,8 +357,20 @@ impl PersistentState {
         self.manager.name.as_deref()
     }
 
-    pub const fn admin_pin(&self) -> Option<&AdminPin> {
-        self.manager.admin_pin.as_ref()
+    pub const fn admin_pin_configured(&self) -> bool {
+        self.manager.admin_pin.is_some()
+    }
+
+    pub fn verify_admin_pin(&self, candidate: &AdminPin) -> bool {
+        self.manager
+            .admin_pin
+            .as_ref()
+            .is_some_and(|verifier| verifier.verify(candidate))
+    }
+
+    pub fn configure_admin_pin(&mut self, pin: &AdminPin) -> Result<(), KioskError> {
+        self.manager.admin_pin = Some(AdminPinVerifier::create(pin)?);
+        Ok(())
     }
 
     pub fn reserved_inventory(&self, slot: &SlotId) -> u32 {
@@ -464,6 +522,41 @@ pub enum SelectionOutcome {
         payment: PaymentKind,
     },
     Denied(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightningLimitReason {
+    InvoiceRate,
+    ProductAbandonedInvoices,
+    KioskAbandonedInvoices,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightningLimit {
+    reason: LightningLimitReason,
+    retry_at_unix_millis: u64,
+}
+
+impl LightningLimit {
+    pub const fn reason(self) -> LightningLimitReason {
+        self.reason
+    }
+
+    pub const fn retry_at_unix_millis(self) -> u64 {
+        self.retry_at_unix_millis
+    }
+
+    pub const fn message(self) -> &'static str {
+        match self.reason {
+            LightningLimitReason::InvoiceRate => "Too many payment requests were started recently.",
+            LightningLimitReason::ProductAbandonedInvoices => {
+                "This product has too many older invoices that can still be paid."
+            }
+            LightningLimitReason::KioskAbandonedInvoices => {
+                "The kiosk has too many older invoices that can still be paid."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -674,6 +767,12 @@ impl KioskEngine {
             }
             (None, PaymentPolicy::Promo) => Ok(SelectionOutcome::PromoCodeRequired { selection }),
             (None, PaymentPolicy::Lightning { price }) => {
+                if let Some(limit) = self.lightning_limit(&selection.product, unix_millis_now()) {
+                    return Ok(SelectionOutcome::Denied(format!(
+                        "{} Please wait before requesting another Lightning invoice.",
+                        limit.message()
+                    )));
+                }
                 let id = self.create_transaction(
                     &selection,
                     PaymentKind::Lightning { price },
@@ -687,6 +786,7 @@ impl KioskEngine {
                         product: selection.product.clone(),
                         amount: price,
                         created_at_unix_millis: unix_millis_now(),
+                        invoice_requested_at_unix_millis: None,
                         state: LightningPurchaseState::InventoryReserved,
                     },
                 );
@@ -728,6 +828,7 @@ impl KioskEngine {
         latest_expiration_unix_seconds: u64,
     ) -> Result<(), KioskError> {
         self.require_active_lightning(id)?;
+        let requested_at = unix_millis_now();
         let purchase = self.lightning_purchase_mut(id)?;
         if purchase.state != LightningPurchaseState::InventoryReserved {
             return Err(KioskError::InvalidTransactionState(id));
@@ -735,7 +836,96 @@ impl KioskEngine {
         purchase.state = LightningPurchaseState::InvoiceCreating {
             latest_expiration_unix_seconds,
         };
+        purchase.invoice_requested_at_unix_millis = Some(requested_at);
         Ok(())
+    }
+
+    pub fn lightning_limit_for_slot(
+        &self,
+        slot: &SlotId,
+        now_unix_millis: u64,
+    ) -> Result<Option<LightningLimit>, KioskError> {
+        let selection = self.selection(slot)?;
+        if !matches!(selection.payment, PaymentPolicy::Lightning { .. }) {
+            return Ok(None);
+        }
+        Ok(self.lightning_limit(&selection.product, now_unix_millis))
+    }
+
+    fn lightning_limit(&self, product: &ProductId, now_unix_millis: u64) -> Option<LightningLimit> {
+        let window_start = now_unix_millis.saturating_sub(LIGHTNING_INVOICE_RATE_WINDOW_MILLIS);
+        let mut recent_attempts = self
+            .state
+            .lightning_purchases
+            .values()
+            .filter_map(|purchase| purchase.invoice_requested_at_unix_millis)
+            .filter(|requested_at| *requested_at > window_start)
+            .collect::<Vec<_>>();
+        if recent_attempts.len() >= MAX_LIGHTNING_INVOICES_PER_WINDOW {
+            recent_attempts.sort_unstable();
+            let oldest_counted =
+                recent_attempts[recent_attempts.len() - MAX_LIGHTNING_INVOICES_PER_WINDOW];
+            return Some(LightningLimit {
+                reason: LightningLimitReason::InvoiceRate,
+                retry_at_unix_millis: oldest_counted
+                    .saturating_add(LIGHTNING_INVOICE_RATE_WINDOW_MILLIS),
+            });
+        }
+
+        let payable_abandoned = self
+            .state
+            .lightning_purchases
+            .values()
+            .filter_map(|purchase| {
+                let expiration = match purchase.state() {
+                    LightningPurchaseState::AbandonedCreating { .. } => u64::MAX,
+                    LightningPurchaseState::AbandonedAwaitingFinal { invoice } => {
+                        invoice.expires_at_unix_seconds.saturating_mul(1_000)
+                    }
+                    _ => return None,
+                };
+                (expiration > now_unix_millis).then_some((purchase.product(), expiration))
+            })
+            .collect::<Vec<_>>();
+        let product_expirations = payable_abandoned
+            .iter()
+            .filter_map(|(purchase_product, expiration)| {
+                (purchase_product == &product).then_some(*expiration)
+            })
+            .collect::<Vec<_>>();
+        if product_expirations.len() >= MAX_PAYABLE_ABANDONED_PER_PRODUCT {
+            let retry_at_unix_millis = product_expirations
+                .iter()
+                .copied()
+                .min()
+                .expect("non-empty");
+            let retry_at_unix_millis = if retry_at_unix_millis == u64::MAX {
+                now_unix_millis.saturating_add(1_000)
+            } else {
+                retry_at_unix_millis
+            };
+            return Some(LightningLimit {
+                reason: LightningLimitReason::ProductAbandonedInvoices,
+                retry_at_unix_millis,
+            });
+        }
+        if payable_abandoned.len() >= MAX_PAYABLE_ABANDONED_KIOSK_WIDE {
+            let retry_at_unix_millis = payable_abandoned
+                .iter()
+                .map(|(_, expiration)| *expiration)
+                .min()
+                .expect("non-empty");
+            let retry_at_unix_millis = if retry_at_unix_millis == u64::MAX {
+                now_unix_millis.saturating_add(1_000)
+            } else {
+                retry_at_unix_millis
+            };
+            return Some(LightningLimit {
+                reason: LightningLimitReason::KioskAbandonedInvoices,
+                retry_at_unix_millis,
+            });
+        }
+        None
     }
 
     /// Records an invoice returned by the asynchronous payment provider.
@@ -1221,6 +1411,8 @@ enum VendResult {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum KioskError {
+    #[error("could not securely hash the admin PIN: {0}")]
+    AdminPinHash(String),
     #[error("promo codes must contain exactly six digits")]
     InvalidPromoCode,
     #[error("promo code not found")]
@@ -1306,6 +1498,13 @@ mod tests {
             operation_id: [1; 32],
             payment_hash: [2; 32],
             expires_at_unix_seconds: 100,
+        }
+    }
+
+    fn payable_invoice() -> LightningInvoice {
+        LightningInvoice {
+            expires_at_unix_seconds: unix_millis_now().div_ceil(1_000).saturating_add(3_600),
+            ..invoice()
         }
     }
 
@@ -1477,6 +1676,71 @@ mod tests {
         engine.lightning_invoice_created(id, invoice()).unwrap();
         let approved = engine.lightning_payment_accepted(id).unwrap();
         assert!(matches!(approved, SelectionOutcome::VendApproved { .. }));
+    }
+
+    #[test]
+    fn invoice_creation_rate_limit_is_durable_purchase_state() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("B1").unwrap();
+        for attempt in 0..MAX_LIGHTNING_INVOICES_PER_WINDOW {
+            let id = transaction_id(engine.machine_selected(&slot).unwrap());
+            engine.begin_lightning_invoice(id, u64::MAX).unwrap();
+            engine
+                .lightning_invoice_creation_failed(id, format!("attempt {attempt}"))
+                .unwrap();
+        }
+
+        assert!(matches!(
+            engine
+                .lightning_limit_for_slot(&slot, unix_millis_now())
+                .unwrap(),
+            Some(LightningLimit {
+                reason: LightningLimitReason::InvoiceRate,
+                ..
+            })
+        ));
+        assert!(matches!(
+            engine.machine_selected(&slot).unwrap(),
+            SelectionOutcome::Denied(_)
+        ));
+    }
+
+    #[test]
+    fn serialized_state_contains_only_an_admin_pin_verifier() {
+        let pin = AdminPin::parse("2468").unwrap();
+        let mut state = PersistentState::default();
+        state.configure_admin_pin(&pin).unwrap();
+
+        let encoded = serde_json::to_string(&state).unwrap();
+        assert!(!encoded.contains("2468"));
+        assert!(encoded.contains("argon2id"));
+        let decoded: PersistentState = serde_json::from_str(&encoded).unwrap();
+        assert!(decoded.verify_admin_pin(&pin));
+    }
+
+    #[test]
+    fn payable_abandoned_invoice_cap_is_per_product() {
+        let mut engine = engine();
+        let slot = SlotId::from_str("B1").unwrap();
+        for _ in 0..MAX_PAYABLE_ABANDONED_PER_PRODUCT {
+            let id = transaction_id(engine.machine_selected(&slot).unwrap());
+            engine.begin_lightning_invoice(id, u64::MAX).unwrap();
+            engine
+                .lightning_invoice_created(id, payable_invoice())
+                .unwrap();
+            engine.cancel_lightning(id).unwrap();
+        }
+
+        assert!(matches!(
+            engine
+                .lightning_limit_for_slot(&slot, unix_millis_now())
+                .unwrap(),
+            Some(LightningLimit {
+                reason: LightningLimitReason::ProductAbandonedInvoices,
+                ..
+            })
+        ));
+        assert_eq!(engine.state().available_inventory(&slot), 2);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use crate::{AssistanceResolution, Msats, ProductId, PurchaseId, SlotHealth, Slot
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub const MANAGER_ALPN: &[u8] = b"lightningvend/manager/2";
 pub const MANAGER_PROTOCOL_VERSION: u16 = 2;
@@ -30,7 +31,7 @@ impl Default for CommandId {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Zeroize, ZeroizeOnDrop)]
 #[serde(transparent)]
 pub struct AdminPin(String);
 

@@ -3,6 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
+pub const LIGHTNING_INVOICE_RATE_WINDOW_MILLIS: u64 = 60_000;
+pub const MAX_LIGHTNING_INVOICES_PER_WINDOW: usize = 6;
+pub const MAX_PAYABLE_ABANDONED_PER_PRODUCT: usize = 3;
+pub const MAX_PAYABLE_ABANDONED_KIOSK_WIDE: usize = 10;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PurchaseId(Uuid);
@@ -138,6 +143,7 @@ pub struct LightningPurchase {
     pub(crate) product: ProductId,
     pub(crate) amount: Msats,
     pub(crate) created_at_unix_millis: u64,
+    pub(crate) invoice_requested_at_unix_millis: Option<u64>,
     pub(crate) state: LightningPurchaseState,
 }
 
@@ -160,6 +166,10 @@ impl LightningPurchase {
 
     pub const fn created_at_unix_millis(&self) -> u64 {
         self.created_at_unix_millis
+    }
+
+    pub const fn invoice_requested_at_unix_millis(&self) -> Option<u64> {
+        self.invoice_requested_at_unix_millis
     }
 
     pub const fn state(&self) -> &LightningPurchaseState {
@@ -200,6 +210,7 @@ mod tests {
             product: ProductId::parse("trail-mix").unwrap(),
             amount: Msats::from_msats(110_000),
             created_at_unix_millis: 1,
+            invoice_requested_at_unix_millis: Some(2),
             state: LightningPurchaseState::InvoiceDisplayed { invoice: invoice() },
         };
         let encoded = serde_json::to_vec(&purchase).unwrap();

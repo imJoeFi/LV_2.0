@@ -25,7 +25,7 @@ pub use kiosk::{
     PaymentControllerStopped, PaymentMachineState,
 };
 pub use manager::{
-    ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
+    EcashExport, ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
     ManagerControllerStopped,
 };
 pub use vendimint::{Machine, MachineBuilder, MachineState, Manager};

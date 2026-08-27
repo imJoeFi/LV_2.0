@@ -7,7 +7,7 @@ use lv_core::{
     ManagerCommand, ManagerRequest, ManagerResponse,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt, io,
     path::{Path, PathBuf},
     thread,
@@ -21,6 +21,7 @@ const CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
 const MANAGER_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 const COMMAND_ATTEMPTS: usize = 3;
 const COMMAND_RETRY_DELAY: Duration = Duration::from_millis(500);
+const ECASH_EXPORT_RECLAIM_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone)]
 pub struct ManagerControllerConfig {
@@ -123,6 +124,12 @@ impl ManagerController {
             .map_err(|_| ManagerControllerStopped)?;
         Ok(command_id)
     }
+
+    pub fn export_funds(&self) -> Result<(), ManagerControllerStopped> {
+        self.commands
+            .send(ManagerControllerCommand::ExportFunds)
+            .map_err(|_| ManagerControllerStopped)
+    }
 }
 
 impl Drop for ManagerController {
@@ -179,6 +186,14 @@ pub enum ManagerControllerEvent {
     ClaimFailed(String),
     FederationUpdated,
     FederationUpdateFailed(String),
+    BalanceUpdated {
+        msats: u64,
+    },
+    FederationStatusUpdated {
+        federation_ids: Vec<String>,
+    },
+    FundsExported(Vec<EcashExport>),
+    FundsExportFailed(String),
     CommandCompleted {
         machine_id: EndpointId,
         command_id: CommandId,
@@ -204,6 +219,13 @@ pub enum ManagerControllerEvent {
     Unavailable(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EcashExport {
+    pub federation_id: String,
+    pub amount_msats: u64,
+    pub token: String,
+}
+
 enum ManagerControllerCommand {
     BeginClaim(String),
     UpdateFederation(String),
@@ -211,6 +233,7 @@ enum ManagerControllerCommand {
         machine_id: EndpointId,
         envelope: CommandEnvelope,
     },
+    ExportFunds,
     Shutdown,
 }
 
@@ -219,6 +242,8 @@ struct ObservedManagerState {
     snapshots: HashMap<EndpointId, KioskSnapshot>,
     errors: HashMap<EndpointId, String>,
     event_sequences: HashMap<EndpointId, EventSequence>,
+    balance_msats: Option<u64>,
+    federation_ids: Vec<String>,
 }
 
 impl ObservedManagerState {
@@ -228,6 +253,8 @@ impl ObservedManagerState {
             snapshots: HashMap::new(),
             errors: HashMap::new(),
             event_sequences: HashMap::new(),
+            balance_msats: None,
+            federation_ids: Vec::new(),
         }
     }
 }
@@ -261,6 +288,9 @@ async fn run(
                 }
                 Some(ManagerControllerCommand::SendCommand { machine_id, envelope }) => {
                     send_command(&manager, &events, machine_id, envelope).await;
+                }
+                Some(ManagerControllerCommand::ExportFunds) => {
+                    export_funds(&manager, &events).await;
                 }
                 Some(ManagerControllerCommand::Shutdown) | None => break,
             },
@@ -375,6 +405,13 @@ async fn refresh_manager_state(
     events: &mpsc::UnboundedSender<ManagerControllerEvent>,
     observed: &mut ObservedManagerState,
 ) {
+    let balance_msats = manager.get_local_balance().await.msats;
+    if observed.balance_msats != Some(balance_msats) {
+        observed.balance_msats = Some(balance_msats);
+        let _ = events.send(ManagerControllerEvent::BalanceUpdated {
+            msats: balance_msats,
+        });
+    }
     let Ok(mut machines) = manager.list_machine_ids().await else {
         return;
     };
@@ -397,6 +434,76 @@ async fn refresh_manager_state(
             refresh_events(manager, events, observed, machine_id).await;
         }
     }
+    refresh_federation_status(manager, events, observed).await;
+}
+
+async fn configured_federations(
+    manager: &Manager,
+) -> anyhow::Result<Vec<fedimint_core::invite_code::InviteCode>> {
+    let mut seen = HashSet::new();
+    let mut federations = Vec::new();
+    for machine_id in manager.list_machine_ids().await? {
+        let Some(config) = manager.get_machine_config(&machine_id).await? else {
+            continue;
+        };
+        let federation = config.federation_invite_code;
+        if seen.insert(federation.federation_id()) {
+            federations.push(federation);
+        }
+    }
+    Ok(federations)
+}
+
+async fn refresh_federation_status(
+    manager: &Manager,
+    events: &mpsc::UnboundedSender<ManagerControllerEvent>,
+    observed: &mut ObservedManagerState,
+) {
+    let Ok(federations) = configured_federations(manager).await else {
+        return;
+    };
+    let mut federation_ids = federations
+        .iter()
+        .map(|invite| invite.federation_id().to_string())
+        .collect::<Vec<_>>();
+    federation_ids.sort_unstable();
+    if federation_ids != observed.federation_ids {
+        observed.federation_ids.clone_from(&federation_ids);
+        let _ = events.send(ManagerControllerEvent::FederationStatusUpdated { federation_ids });
+    }
+}
+
+async fn export_funds(manager: &Manager, events: &mpsc::UnboundedSender<ManagerControllerEvent>) {
+    let result = async {
+        let federations = configured_federations(manager).await?;
+        if federations.is_empty() {
+            anyhow::bail!("configure a federation on at least one paired kiosk first");
+        }
+        let mut exports = Vec::new();
+        for invite in federations {
+            let federation_id = invite.federation_id();
+            if let Some(notes) = manager
+                .sweep_all_ecash_notes(federation_id, ECASH_EXPORT_RECLAIM_AFTER, true, None::<()>)
+                .await?
+            {
+                exports.push(EcashExport {
+                    federation_id: federation_id.to_string(),
+                    amount_msats: notes.total_amount().msats,
+                    token: notes.to_string(),
+                });
+            }
+        }
+        if exports.is_empty() {
+            anyhow::bail!("the manager wallet has no funds available to export");
+        }
+        Ok::<_, anyhow::Error>(exports)
+    }
+    .await;
+    let event = match result {
+        Ok(exports) => ManagerControllerEvent::FundsExported(exports),
+        Err(error) => ManagerControllerEvent::FundsExportFailed(error.to_string()),
+    };
+    let _ = events.send(event);
 }
 
 async fn refresh_snapshot(

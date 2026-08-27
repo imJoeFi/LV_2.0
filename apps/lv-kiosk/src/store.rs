@@ -8,7 +8,7 @@ use thiserror::Error;
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("kiosk_state");
 const STATE_KEY: &str = "persistent_state";
-const STATE_SCHEMA_VERSION: u32 = 2;
+const STATE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredState {
@@ -216,8 +216,10 @@ mod tests {
         let directory = std::env::temp_dir().join(format!("lv-kiosk-{}", uuid::Uuid::new_v4()));
         let store = StateStore::open(directory.join("state.redb")).unwrap();
         let catalog = Catalog::parse(CATALOG, Path::new(".")).unwrap();
+        let mut existing = PersistentState::default();
+        existing.set_inventory(SlotId::from_str("A1").unwrap(), 9);
         let state = StateStore::replace_codes_from_csv(
-            &PersistentState::default(),
+            &existing,
             &catalog,
             "code,product_id,quantity\n123456,water,2\n".as_bytes(),
         )
@@ -228,6 +230,7 @@ mod tests {
             .entitlement(&ProductId::parse("water").unwrap())
             .unwrap();
         assert_eq!(entitlement.granted(), 2);
+        assert_eq!(state.inventory(&SlotId::from_str("A1").unwrap()), 9);
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }

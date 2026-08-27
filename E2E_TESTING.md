@@ -26,21 +26,24 @@ The current scenario verifies that:
    PIN;
 3. the manager can send the regtest federation configuration to the kiosk;
 4. the claim remains visible through the manager API; and
-5. an authenticated request and response can cross LightningVEND's custom
-   `lightningvend/manager/1` Iroh ALPN without changing their wire values.
+5. idempotent commands and ordered events cross LightningVEND's authenticated
+   `lightningvend/manager/2` Iroh ALPN;
+6. a Lightning slot is stocked remotely and durably reserved;
+7. a real 100-sat BOLT11 is created and paid through the regtest gateway;
+8. the funded purchase advances through a simulated successful MDB vend;
+9. inventory and purchase completion reach the manager event log; and
+10. the manager sweeps the completed payment.
 
 This test is deliberately opt-in. `just check` excludes `lv-e2e-tests`, so
 ordinary formatting, linting, and unit-test runs do not start daemons or pay the
 native Fedimint build cost.
 
-## Next coverage
-
-Once the kiosk and manager orchestration is available independently of Iced,
-extend this runner to drive the complete purchase path: configure inventory,
-request and display an invoice, pay it through the regtest gateway, observe the
-durable funded transition, simulate an MDB vend result, and verify the manager
-event log. Restart cases should be explicit scenarios, especially abandonment,
-funding during shutdown, and a crash after vend authorization.
+The scenario runs the real payment and manager transports with the headless
+`KioskEngine`; it deliberately substitutes a typed simulated success for the
+physical MDB adapter. Physical hardware acceptance and power-cycle cases remain
+in `MDB_ACTOR_FOLLOW_UPS.md`. Future automated coverage should add explicit
+restart scenarios, especially abandonment, funding during shutdown, and a
+crash after vend authorization.
 
 Rendered Iced screenshot tests should remain a separate deterministic suite.
 They are valuable for stable screens and components, but federation timing,

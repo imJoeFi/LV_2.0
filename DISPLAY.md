@@ -3,8 +3,8 @@
 The customer-facing screen that shows the Lightning invoice QR, mounted in the
 AP 113 door where the dollar bill mech used to be.
 
-**Status: ordered, not yet fitted.** Everything below is from the vendor
-drawing and wiki. Verify against the physical part on arrival — items marked
+**Status: received, not yet physically qualified on the kiosk.** Everything
+below is from the vendor drawing and wiki. Verify against the physical part — items marked
 **[VERIFY]** are the ones most likely to bite.
 
 Resolves the open hardware question in [`MDB_HACKING.md`](MDB_HACKING.md) —

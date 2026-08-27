@@ -1,15 +1,20 @@
+mod scanner;
+
 use clap::Parser;
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Column};
+use iced::widget::{
+    button, column, container, image, qr_code, row, scrollable, text, text_input, Column,
+};
 use iced::{time, window, Element, Length, Size, Subscription, Task, Theme};
-use iroh::EndpointId;
+use iroh::{EndpointAddr, EndpointId};
 use lv_core::{
     AdminPin, AssistanceResolution, CommandResult, EventEnvelope, FreeVendScope, KioskSnapshot,
     ManagerCommand, ManagerEvent, PaymentSummary, PurchaseId, PurchaseSummary,
     PurchaseSummaryState, SlotHealth, SlotId, SlotSnapshot, VendAuthorizationSnapshot,
 };
 use lv_vendimint::{
-    ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
+    EcashExport, ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
 };
+use scanner::{QrScanner, ScannerEvent};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -34,6 +39,8 @@ fn main() -> iced::Result {
     .title("LightningVEND Manager")
     .window(window::Settings {
         size: Size::new(1200.0, 800.0),
+        min_size: Some(Size::new(900.0, 600.0)),
+        resizable: true,
         ..window::Settings::default()
     })
     .run()
@@ -98,6 +105,23 @@ struct ManagerApp {
     snapshots: HashMap<EndpointId, KioskSnapshot>,
     machine_errors: HashMap<EndpointId, String>,
     activity: HashMap<EndpointId, Vec<EventEnvelope>>,
+    scanner: Option<QrScanner>,
+    camera_preview: Option<image::Handle>,
+    balance_msats: u64,
+    federation_ids: Vec<String>,
+    funds_export: FundsExportState,
+}
+
+enum FundsExportState {
+    Closed,
+    Confirming,
+    Exporting,
+    Ready(Vec<RenderedEcashExport>),
+}
+
+struct RenderedEcashExport {
+    export: EcashExport,
+    qr: Option<qr_code::Data>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +136,8 @@ enum Message {
     Poll,
     PairingPayloadChanged(String),
     BeginClaim,
+    OpenScanner,
+    CloseScanner,
     ConfirmClaim,
     RejectClaim,
     FederationInviteChanged(String),
@@ -128,6 +154,10 @@ enum Message {
     DisarmVendAuthorization,
     ResolveUncertain(PurchaseId, bool),
     ResolveAssistance(PurchaseId, AssistanceResolution),
+    RequestFundsExport,
+    ConfirmFundsExport,
+    CancelFundsExport,
+    CopyFundsExport(usize),
 }
 
 impl ManagerApp {
@@ -148,6 +178,11 @@ impl ManagerApp {
             snapshots: HashMap::new(),
             machine_errors: HashMap::new(),
             activity: HashMap::new(),
+            scanner: None,
+            camera_preview: None,
+            balance_msats: 0,
+            federation_ids: Vec::new(),
+            funds_export: FundsExportState::Closed,
         })
     }
 
@@ -159,6 +194,15 @@ impl ManagerApp {
                 self.notice = None;
             }
             Message::BeginClaim => self.begin_claim(),
+            Message::OpenScanner => {
+                self.camera_preview = None;
+                self.scanner = Some(QrScanner::start());
+                self.notice = None;
+            }
+            Message::CloseScanner => {
+                self.scanner = None;
+                self.camera_preview = None;
+            }
             Message::ConfirmClaim => self.respond_to_claim(true),
             Message::RejectClaim => self.respond_to_claim(false),
             Message::FederationInviteChanged(invite) => {
@@ -207,17 +251,72 @@ impl ManagerApp {
                     note: None,
                 });
             }
+            Message::RequestFundsExport => {
+                self.funds_export = FundsExportState::Confirming;
+            }
+            Message::ConfirmFundsExport => match self.controller.export_funds() {
+                Ok(()) => self.funds_export = FundsExportState::Exporting,
+                Err(error) => self.notice = Some(error.to_string()),
+            },
+            Message::CancelFundsExport => self.funds_export = FundsExportState::Closed,
+            Message::CopyFundsExport(index) => {
+                if let FundsExportState::Ready(exports) = &self.funds_export {
+                    if let Some(export) = exports.get(index) {
+                        return iced::clipboard::write(export.export.token.clone());
+                    }
+                }
+            }
         }
         Task::none()
     }
 
     fn poll(&mut self) {
+        self.poll_scanner();
         let mut events = Vec::new();
         while let Some(event) = self.controller.try_event() {
             events.push(event);
         }
         for event in events {
             self.handle_event(event);
+        }
+    }
+
+    fn poll_scanner(&mut self) {
+        let mut scanner_events = Vec::new();
+        if let Some(scanner) = &self.scanner {
+            while let Some(event) = scanner.try_event() {
+                scanner_events.push(event);
+            }
+        }
+        for event in scanner_events {
+            match event {
+                ScannerEvent::Frame {
+                    width,
+                    height,
+                    rgba,
+                } => {
+                    self.camera_preview = Some(image::Handle::from_rgba(width, height, rgba));
+                }
+                ScannerEvent::Decoded(payload) => {
+                    if serde_json::from_str::<EndpointAddr>(&payload).is_ok() {
+                        self.pairing_payload = payload;
+                        self.scanner = None;
+                        self.camera_preview = None;
+                        self.begin_claim();
+                    } else {
+                        self.notice = Some(
+                            "That QR code is not a LightningVEND kiosk pairing code.".to_owned(),
+                        );
+                        self.camera_preview = None;
+                        self.scanner = Some(QrScanner::start());
+                    }
+                }
+                ScannerEvent::Failed(error) => {
+                    self.scanner = None;
+                    self.camera_preview = None;
+                    self.notice = Some(error);
+                }
+            }
         }
     }
 
@@ -237,6 +336,27 @@ impl ManagerApp {
             }
             ManagerControllerEvent::FederationUpdateFailed(error) => {
                 self.notice = Some(format!("Could not configure the federation: {error}"));
+            }
+            ManagerControllerEvent::BalanceUpdated { msats } => {
+                self.balance_msats = msats;
+            }
+            ManagerControllerEvent::FederationStatusUpdated { federation_ids } => {
+                self.federation_ids = federation_ids;
+            }
+            ManagerControllerEvent::FundsExported(exports) => {
+                self.funds_export = FundsExportState::Ready(
+                    exports
+                        .into_iter()
+                        .map(|export| RenderedEcashExport {
+                            qr: qr_code::Data::new(export.token.as_bytes()).ok(),
+                            export,
+                        })
+                        .collect(),
+                );
+            }
+            ManagerControllerEvent::FundsExportFailed(error) => {
+                self.funds_export = FundsExportState::Closed;
+                self.notice = Some(format!("Could not export funds: {error}"));
             }
             ManagerControllerEvent::CommandCompleted {
                 result,
@@ -302,7 +422,7 @@ impl ManagerApp {
 
     fn begin_claim(&mut self) {
         if self.pairing_payload.trim().is_empty() {
-            self.notice = Some("Paste the kiosk pairing payload first.".to_owned());
+            self.notice = Some("Scan the kiosk QR or paste its pairing payload first.".to_owned());
             return;
         }
         match self.controller.begin_claim(self.pairing_payload.clone()) {
@@ -428,7 +548,15 @@ impl ManagerApp {
             ]
             .spacing(4)
             .width(Length::Fill),
-            text(format!("{} kiosk(s)", self.machines.len())).size(17)
+            column![
+                text(format_msats(self.balance_msats)).size(20),
+                text(format!("{} kiosk(s)", self.machines.len())).size(15)
+            ]
+            .align_x(iced::Alignment::End)
+            .spacing(3),
+            button("Export funds")
+                .padding(11)
+                .on_press_maybe((self.balance_msats > 0).then_some(Message::RequestFundsExport))
         ]
         .align_y(iced::Alignment::Center);
         let content = row![self.sidebar(), self.detail()].spacing(24);
@@ -443,6 +571,9 @@ impl ManagerApp {
                     .width(Length::Fill)
                     .style(container::secondary),
             );
+        }
+        if !matches!(self.funds_export, FundsExportState::Closed) {
+            page = page.push(self.funds_export_view());
         }
         page = page.push(content);
         container(page)
@@ -469,18 +600,56 @@ impl ManagerApp {
         if self.machines.is_empty() {
             machine_list = machine_list.push(text("No kiosks paired yet.").size(16));
         }
-        let pairing = column![
-            text("Pair another kiosk").size(20),
-            text("Paste the payload encoded by the QR shown on the kiosk.").size(14),
-            text_input("Kiosk pairing payload", &self.pairing_payload)
-                .on_input(Message::PairingPayloadChanged)
-                .padding(11),
-            button("Connect")
-                .padding(11)
-                .width(Length::Fill)
-                .on_press(Message::BeginClaim)
-        ]
-        .spacing(9);
+        let pairing: Element<'_, Message> = if self.scanner.is_some() {
+            let preview: Element<'_, Message> = self.camera_preview.as_ref().map_or_else(
+                || {
+                    container(text("Starting camera…"))
+                        .height(220)
+                        .center(Length::Fill)
+                        .into()
+                },
+                |handle| {
+                    container(
+                        image(handle.clone())
+                            .width(Length::Fill)
+                            .height(220)
+                            .content_fit(iced::ContentFit::Contain),
+                    )
+                    .style(container::rounded_box)
+                    .into()
+                },
+            );
+            column![
+                text("Scan kiosk QR").size(20),
+                preview,
+                text("Hold the kiosk pairing QR in view.").size(14),
+                button("Cancel camera")
+                    .padding(11)
+                    .width(Length::Fill)
+                    .on_press(Message::CloseScanner)
+            ]
+            .spacing(9)
+            .into()
+        } else {
+            column![
+                text("Pair another kiosk").size(20),
+                button("Scan kiosk QR")
+                    .padding(12)
+                    .width(Length::Fill)
+                    .style(button::primary)
+                    .on_press(Message::OpenScanner),
+                text("Or paste the payload encoded by the kiosk QR.").size(14),
+                text_input("Kiosk pairing payload", &self.pairing_payload)
+                    .on_input(Message::PairingPayloadChanged)
+                    .padding(11),
+                button("Connect")
+                    .padding(11)
+                    .width(Length::Fill)
+                    .on_press(Message::BeginClaim)
+            ]
+            .spacing(9)
+            .into()
+        };
         container(column![machine_list, pairing].spacing(28))
             .padding(18)
             .width(320)
@@ -560,8 +729,9 @@ impl ManagerApp {
         container(
             column![
                 text("Pair your first kiosk").size(30),
-                text("Open the kiosk's pairing screen, then paste its QR payload on the left.")
-                    .size(18),
+                text("Open the kiosk's pairing screen, then scan its QR on the left.").size(18),
+                text("Manual payload entry remains available if camera access is unavailable.")
+                    .size(15),
                 self.federation_form()
             ]
             .spacing(18),
@@ -574,9 +744,22 @@ impl ManagerApp {
     }
 
     fn federation_form(&self) -> Element<'_, Message> {
+        let status = if self.federation_ids.is_empty() {
+            "No federation confirmed on a paired kiosk yet.".to_owned()
+        } else {
+            format!(
+                "Configured: {}",
+                self.federation_ids
+                    .iter()
+                    .map(|id| short_text(id, 16))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         column![
             text("Payment federation").size(20),
             text("This configuration is securely synced to every paired kiosk.").size(14),
+            text(status).size(14),
             text_input("Fedimint invite code", &self.federation_invite)
                 .on_input(Message::FederationInviteChanged)
                 .padding(11),
@@ -586,6 +769,82 @@ impl ManagerApp {
         ]
         .spacing(9)
         .into()
+    }
+
+    fn funds_export_view(&self) -> Element<'_, Message> {
+        let content: Element<'_, Message> = match &self.funds_export {
+            FundsExportState::Closed => container("").into(),
+            FundsExportState::Confirming => column![
+                text("Export bearer ecash?").size(24),
+                text(format!(
+                    "This will export up to {} from the manager wallet. Anyone with the token can claim it.",
+                    format_msats(self.balance_msats)
+                )),
+                text("Claim the token within 24 hours. Unclaimed funds are automatically reclaimed by this manager."),
+                row![
+                    button("Cancel")
+                        .padding(12)
+                        .on_press(Message::CancelFundsExport),
+                    button("Export funds")
+                        .padding(12)
+                        .style(button::warning)
+                        .on_press(Message::ConfirmFundsExport)
+                ]
+                .spacing(10)
+            ]
+            .spacing(10)
+            .into(),
+            FundsExportState::Exporting => column![
+                text("Preparing ecash export…").size(22),
+                text("Keep the manager open until the token appears.")
+            ]
+            .spacing(8)
+            .into(),
+            FundsExportState::Ready(exports) => {
+                let cards = exports.iter().enumerate().fold(
+                    Column::new().spacing(12),
+                    |cards, (index, rendered)| {
+                        let qr: Element<'_, Message> = rendered.qr.as_ref().map_or_else(
+                            || text("This token is too large to render as one QR; use Copy token.").into(),
+                            |data| container(qr_code(data).total_size(240)).padding(5).into(),
+                        );
+                        cards.push(
+                            container(column![
+                                text(format_msats(rendered.export.amount_msats)).size(20),
+                                text(format!("Federation {}", short_text(&rendered.export.federation_id, 20))).size(13),
+                                qr,
+                                text_input("Bearer ecash token", &rendered.export.token)
+                                    .secure(true)
+                                    .padding(9),
+                                button("Copy token")
+                                    .padding(11)
+                                    .on_press(Message::CopyFundsExport(index))
+                            ]
+                            .spacing(8))
+                            .padding(12)
+                            .style(container::rounded_box),
+                        )
+                    },
+                );
+                column![
+                    row![
+                        text("Ecash export ready").size(24).width(Length::Fill),
+                        button("Done")
+                            .padding(11)
+                            .on_press(Message::CancelFundsExport)
+                    ],
+                    text("These are bearer tokens. Copy or scan them into the receiving wallet now."),
+                    scrollable(cards).height(320)
+                ]
+                .spacing(10)
+                .into()
+            }
+        };
+        container(content)
+            .padding(16)
+            .width(Length::Fill)
+            .style(container::warning)
+            .into()
     }
 
     fn remote_controls(&self, snapshot: &KioskSnapshot) -> Element<'_, Message> {
@@ -794,6 +1053,18 @@ impl ManagerApp {
 fn short_machine_id(machine_id: &EndpointId) -> String {
     let full = machine_id.to_string();
     format!("{}…{}", &full[..8], &full[full.len() - 6..])
+}
+
+fn short_text(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        value.to_owned()
+    } else {
+        value.chars().take(maximum).collect::<String>() + "…"
+    }
+}
+
+fn format_msats(msats: u64) -> String {
+    format!("{msats} msats")
 }
 
 fn authorization_text(authorization: Option<&VendAuthorizationSnapshot>) -> String {

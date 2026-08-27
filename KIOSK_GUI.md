@@ -1,6 +1,6 @@
 # LightningVEND kiosk GUI
 
-The `lv-kiosk` binary is the 480×800 portrait touchscreen application. MDB and
+The `lv-kiosk` binary is the fixed 720×720 customer touchscreen application. MDB and
 Lightning are configured independently: `--port` enables the live vending
 machine, while `--vendimint-data` enables the persistent mainnet payment
 machine. Omitting either option keeps that side simulated, so the command below
@@ -25,8 +25,8 @@ The sample promo codes are:
 
 The simulator admin PIN is `2468`. Override it with `--admin-pin`; do not use the
 sample PIN in a deployed kiosk. Add `--fullscreen` for the borderless kiosk
-window. Development mode is a fixed logical 480×800 window, matching an
-800×480 panel rotated to portrait.
+window. Development mode is a fixed logical 720×720 window matching the
+Waveshare display documented in `DISPLAY.md`.
 
 The panel labeled **SIMULATED VENDING KEYPAD** stands in for selections that the
 VMC delivers through `MdbSession` events in hardware mode.
@@ -90,7 +90,7 @@ must never be shared by two running kiosk processes.
 With real payments enabled, the kiosk:
 
 - runs Vendimint on a dedicated Tokio thread and installs the authenticated
-  `lightningvend/manager/1` Iroh protocol on the same endpoint;
+  `lightningvend/manager/2` Iroh protocol on the same endpoint;
 - durably reserves inventory before asking Vendimint for an invoice;
 - durably stores the BOLT11, operation ID, payment hash, and expiration before
   displaying the QR;
@@ -111,9 +111,22 @@ To use real MDB and real Lightning together on the Pi, supply both options:
   --fullscreen
 ```
 
-The manager application does not yet implement QR scanning/claim initiation,
-so the kiosk half of this pairing flow is present before the operational
-manager workflow is complete.
+Run the resizable, landscape manager application on the operator's MacBook:
+
+```sh
+cargo run --release --bin lv-manager -- --data data/vendimint-manager
+```
+
+The manager scans the kiosk QR with the MacBook camera (manual paste remains a
+fallback), performs the physical claim-PIN confirmation, configures the
+federation, and exposes remote inventory, health, vend authorization, and
+assistance controls. macOS may ask the terminal or packaged application for
+camera access the first time the scanner opens.
+
+The manager also shows its exact millisatoshi wallet balance. **Export funds**
+creates self-contained bearer ecash as QR and copyable text after an explicit
+confirmation. The token must be claimed within 24 hours; otherwise Vendimint
+reclaims the unclaimed notes into the manager wallet.
 
 ### Promo exercise
 
@@ -162,7 +175,8 @@ The catalog and mutable machine state are intentionally separate.
 - product-level promo grants, claims, and reservations;
 - transaction history and uncertain results;
 - Lightning invoice identity, purchase state, and per-slot inventory
-  reservations; and
+  reservations;
+- a salted Argon2id admin-PIN verifier (never the plaintext PIN); and
 - a schema version around the disposable JSON state document.
 
 `config/promo_codes.csv` grants products rather than slots:
@@ -178,6 +192,19 @@ healthy promo slot containing a granted product. The entitlement is reserved
 durably before approval, claimed only on `VEND SUCCESS`, and released on
 failure. An uncertain outcome keeps the entitlement reserved until an
 administrator reconciles it.
+
+Production promo imports are separate from demo seeding. Validate a CSV without
+changing the database:
+
+```sh
+lv-kiosk \
+  --catalog /etc/lightningvend/kiosk.toml \
+  --database /var/lib/lightningvend/lv-kiosk.redb \
+  import-promo-codes --file codes.csv --dry-run
+```
+
+Replace every existing promo code and entitlement atomically with `--yes` in
+place of `--dry-run`. Catalog and inventory are never modified by this command.
 
 ## Application and MDB sessions
 
@@ -195,6 +222,16 @@ Lightning remains machine-first and has a 40-second decision window because the
 AP113 VMC ends an unanswered vend at about 60 seconds. Promo remains
 screen-first, so authentication and entitlement display happen before a
 physical selection.
+
+Promo entry, browsing, and result screens return home after 20 seconds without
+a meaningful action. A displayed Lightning invoice always follows its fixed
+40-second payment window, dispensing is never interrupted by UI inactivity,
+and a local admin session closes and disarms after two idle minutes.
+
+Invoice creation is limited to six attempts per rolling minute. The kiosk also
+allows at most three still-payable abandoned invoices per product and ten
+kiosk-wide. These limits are derived from durable purchase history, survive a
+restart, do not hold inventory, and show a retry countdown when reached.
 
 ## Persistence boundary
 
@@ -230,14 +267,11 @@ transaction history through the existing durable domain transitions.
 Before real money is enabled, the outstanding ACK/retransmission and adapter
 deadline issues in `MDB_ACTOR_FOLLOW_UPS.md` still need resolving.
 
-## Not implemented yet
+## Intentionally deferred or pending physical qualification
 
-- QR scanning/claim initiation and the operational manager dashboard;
-- applying manager commands to durable kiosk state and relaying its append-only
-  event log;
-- invoice creation rate limits and a cap on concurrently payable abandoned
-  invoices;
-- production secret handling for the admin PIN;
-- automatic Raspberry Pi startup and display rotation configuration;
-- a promo CSV generation/import utility beyond the parser and sample file;
-- product management in the admin UI.
+- automatic Raspberry Pi startup and display configuration;
+- product/catalog management in the admin UI;
+- automatic refunds (version one uses operator-assisted resolution);
+- manager identity backup and safe re-pairing; and
+- the physical MDB reliability and power-cycle work in
+  `MDB_ACTOR_FOLLOW_UPS.md`.
