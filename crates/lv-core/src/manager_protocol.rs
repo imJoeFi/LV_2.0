@@ -30,7 +30,7 @@ impl Default for CommandId {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct AdminPin(String);
 
@@ -52,6 +52,16 @@ impl AdminPin {
 impl fmt::Debug for AdminPin {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("AdminPin([REDACTED])")
+    }
+}
+
+impl<'de> Deserialize<'de> for AdminPin {
+    fn deserialize<Deserializer>(deserializer: Deserializer) -> Result<Self, Deserializer::Error>
+    where
+        Deserializer: serde::Deserializer<'de>,
+    {
+        let pin = String::deserialize(deserializer)?;
+        Self::parse(pin).map_err(serde::de::Error::custom)
     }
 }
 
@@ -294,6 +304,7 @@ mod tests {
         assert!(AdminPin::parse("123456789012").is_ok());
         assert!(AdminPin::parse("123").is_err());
         assert!(AdminPin::parse("1234567890123").is_err());
+        assert!(serde_json::from_str::<AdminPin>(r#""123""#).is_err());
     }
 
     #[test]

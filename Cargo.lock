@@ -6980,7 +6980,9 @@ dependencies = [
 name = "lv-manager"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "iced",
+ "iroh 0.97.0",
  "lv-core",
  "lv-vendimint",
 ]

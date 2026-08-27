@@ -9,7 +9,9 @@ name = "lv-manager"
 path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 iced.workspace = true
+iroh.workspace = true
 lv-core.workspace = true
 lv-vendimint.workspace = true
 

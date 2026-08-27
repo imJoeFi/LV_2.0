@@ -183,9 +183,14 @@ impl KioskEngine {
                 purchase_id,
                 resolution,
                 note,
-            } => self
-                .resolve_assistance(purchase_id, resolution, note)
-                .map_err(ManagerCommandError::from)?,
+            } => {
+                self.resolve_assistance(purchase_id, resolution, note)
+                    .map_err(ManagerCommandError::from)?;
+                events.push(ManagerEvent::AssistanceResolved {
+                    purchase_id,
+                    resolution,
+                });
+            }
             ManagerCommand::ArmFreeVend {
                 scope,
                 expires_in_seconds,

@@ -1,6 +1,7 @@
 //! Vendimint-backed identity, pairing, and authenticated manager RPC transport.
 
 mod kiosk;
+mod manager;
 
 use iroh::{
     endpoint::Connection,
@@ -22,6 +23,10 @@ use tokio::{
 pub use kiosk::{
     ClaimRequest, PaymentController, PaymentControllerConfig, PaymentControllerEvent,
     PaymentControllerStopped, PaymentMachineState,
+};
+pub use manager::{
+    ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
+    ManagerControllerStopped,
 };
 pub use vendimint::{Machine, MachineBuilder, MachineState, Manager};
 

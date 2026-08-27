@@ -74,9 +74,9 @@ struct Args {
     #[arg(long)]
     fullscreen: bool,
 
-    /// Shared admin PIN.
-    #[arg(long, default_value = "2468")]
-    admin_pin: String,
+    /// Optional bootstrap admin PIN. A paired manager can set the initial PIN remotely.
+    #[arg(long)]
+    admin_pin: Option<String>,
 }
 
 fn main() -> iced::Result {
@@ -168,7 +168,7 @@ struct KioskApp {
     payment_status: PaymentStatus,
     pending_claim: Option<ClaimRequest>,
     active_mdb_vend: Option<ActiveMdbVend>,
-    admin_pin: String,
+    bootstrap_admin_pin: Option<String>,
     page: Page,
     promo_input: String,
     admin_input: String,
@@ -347,8 +347,8 @@ enum Message {
 
 impl KioskApp {
     fn boot(args: &Args) -> Result<Self, String> {
-        if args.admin_pin.len() < 4 || !args.admin_pin.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err("--admin-pin must contain at least four digits".to_owned());
+        if let Some(pin) = &args.admin_pin {
+            lv_core::AdminPin::parse(pin.clone()).map_err(|error| error.to_string())?;
         }
         let catalog = Catalog::load(&args.catalog).map_err(|error| error.to_string())?;
         let store = StateStore::open(&args.database).map_err(|error| error.to_string())?;
@@ -414,7 +414,10 @@ impl KioskApp {
             payment_status,
             pending_claim: None,
             active_mdb_vend: None,
-            admin_pin: args.admin_pin.clone(),
+            bootstrap_admin_pin: args
+                .admin_pin
+                .clone()
+                .or_else(|| args.seed_demo.then(|| "2468".to_owned())),
             page: Page::Ready,
             promo_input: String::new(),
             admin_input: String::new(),
@@ -471,11 +474,7 @@ impl KioskApp {
             }
             Message::SubmitPromo => self.submit_promo_code(),
             Message::Done => self.finish_customer_session(false),
-            Message::OpenAdmin => {
-                self.admin_input.clear();
-                self.notice.clear();
-                self.page = Page::AdminPin;
-            }
+            Message::OpenAdmin => self.open_admin(),
             Message::AdminDigit(digit) => {
                 if self.admin_input.len() < 12 {
                     self.admin_input.push(digit);
@@ -1251,11 +1250,14 @@ impl KioskApp {
             );
             return;
         }
-        let expected_pin = self
-            .engine
-            .state()
-            .admin_pin()
-            .map_or(self.admin_pin.as_str(), lv_core::AdminPin::expose);
+        let Some(expected_pin) = self.configured_admin_pin() else {
+            self.admin_input.clear();
+            self.show_transient_notice(
+                "Admin access will be available after the manager sets an initial PIN.",
+                NoticeSeverity::Warning,
+            );
+            return;
+        };
         if self.admin_input == expected_pin {
             self.invalid_admin_attempts = 0;
             self.admin_locked_until = None;
@@ -1284,6 +1286,27 @@ impl KioskApp {
         self.persist();
         self.page = Page::Ready;
         self.notice.clear();
+    }
+
+    fn open_admin(&mut self) {
+        if self.configured_admin_pin().is_none() {
+            self.show_transient_notice(
+                "Pair this kiosk with its manager to configure admin access.",
+                NoticeSeverity::Warning,
+            );
+            return;
+        }
+        self.admin_input.clear();
+        self.notice.clear();
+        self.page = Page::AdminPin;
+    }
+
+    fn configured_admin_pin(&self) -> Option<&str> {
+        self.engine
+            .state()
+            .admin_pin()
+            .map(lv_core::AdminPin::expose)
+            .or(self.bootstrap_admin_pin.as_deref())
     }
 
     fn finish_customer_session(&mut self, timed_out: bool) {
