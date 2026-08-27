@@ -7,6 +7,7 @@ integration, and the two Iced applications can evolve independently.
 |---|---|
 | `lv-core` | Catalog, exact `Msats`, inventory/entitlements, durable purchases, and manager command/event wire types |
 | `lv-mdb` | MDB Level 1 protocol, serial transport, typed session ownership, and the test harness |
+| `lv-ui` | Shared black-on-white raster QR rendering with integer modules and a scanner-safe quiet zone |
 | `lv-vendimint` | Vendimint identity/payment facade and authenticated Iroh manager RPC framing |
 | `lv-kiosk` | 720×720 customer/admin Iced UI, redb persistence, and orchestration of the state-owning actors |
 | `lv-manager` | Resizable landscape manager Iced application for pairing, operations, and funds export |
@@ -84,5 +85,8 @@ verifier and persists only that verifier. Command results do not retain the raw
 PIN.
 
 The manager polls wallet balance and per-kiosk snapshots alongside ordered
-events. Funds export spends local notes into a self-contained out-of-band ecash
-token with a 24-hour automatic reclaim timeout if nobody claims it.
+events. Vendimint selects and persists one e-cash module per federation: new
+dual-module joins prefer mint v2, while legacy wallets remain on mint v1. Funds
+export produces one self-contained bearer token per federation. Mint-v1 tokens
+have a 24-hour automatic reclaim timeout; mint-v2 tokens do not automatically
+reclaim and must be safeguarded until claimed.

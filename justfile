@@ -25,4 +25,4 @@ test-e2e:
 
 [private]
 _test-e2e:
-    cargo run --locked -p lv-e2e-tests
+    FM_ENABLE_MODULE_MINTV2=1 cargo run --locked -p lv-e2e-tests

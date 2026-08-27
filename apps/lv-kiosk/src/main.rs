@@ -7,7 +7,6 @@ use iced::widget::{
     button, column, container, image, mouse_area, operation, progress_bar, rich_text, row,
     scrollable, span, text, Column, Id, Row,
 };
-use iced::widget::{qr_code, qr_code::Data as QrData};
 use iced::{time, window, Color, Element, Length, Size, Subscription, Task, Theme};
 use lv_core::{
     ArmMode, Catalog, KioskEngine, LightningInvoice, LightningPurchaseState, MachineSelection,
@@ -15,6 +14,7 @@ use lv_core::{
     SlotHealth, SlotId, TransactionId, TransactionStatus,
 };
 use lv_mdb::{ItemNumber, Level1Amount, MdbConfig, SessionEndReason, VendDecisionError, VendId};
+use lv_ui::RasterQr;
 use lv_vendimint::{
     ClaimRequest, IncomingManagerRequest, PaymentController, PaymentControllerConfig,
     PaymentControllerEvent, PaymentMachineState,
@@ -39,6 +39,8 @@ const KEYPAD_BUTTON_HEIGHT: f32 = 80.0;
 const MDB_APPLICATION_RESPONSE_TIME: Duration = Duration::from_secs(46);
 const MDB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PAIRING_QR_SIDE: u16 = 340;
+const INVOICE_QR_SIDE: u16 = 290;
 
 #[derive(Debug, Parser)]
 #[command(about = "720×720 LightningVEND kiosk UI")]
@@ -293,7 +295,7 @@ enum PaymentStatus {
     Starting,
     Unclaimed {
         pairing_payload: String,
-        qr: Option<QrData>,
+        qr: Option<RasterQr>,
     },
     ClaimedUnconfigured,
     Ready,
@@ -348,7 +350,7 @@ enum Page {
         price: Msats,
         started: Instant,
         confirming_exit: bool,
-        qr: QrData,
+        qr: RasterQr,
     },
     LightningLimited {
         slot: SlotId,
@@ -391,6 +393,7 @@ enum Message {
     PollPayments,
     ConfirmClaim,
     RejectClaim,
+    CopyPairingPayload,
     OpenPromo,
     PromoDigit(char),
     PromoBackspace,
@@ -537,6 +540,14 @@ impl KioskApp {
             Message::PollPayments => self.poll_payments(),
             Message::ConfirmClaim => self.respond_to_claim(true),
             Message::RejectClaim => self.respond_to_claim(false),
+            Message::CopyPairingPayload => {
+                if let PaymentStatus::Unclaimed {
+                    pairing_payload, ..
+                } = &self.payment_status
+                {
+                    return iced::clipboard::write(pairing_payload.clone());
+                }
+            }
             Message::OpenPromo => {
                 self.promo_input.clear();
                 self.notice.clear();
@@ -676,7 +687,7 @@ impl KioskApp {
             PaymentControllerEvent::MachineStateChanged(state) => {
                 self.payment_status = match state {
                     PaymentMachineState::Unclaimed { pairing_payload } => {
-                        let qr = QrData::new(pairing_payload.as_bytes()).ok();
+                        let qr = RasterQr::new(pairing_payload.as_bytes(), PAIRING_QR_SIDE).ok();
                         PaymentStatus::Unclaimed {
                             pairing_payload,
                             qr,
@@ -750,7 +761,7 @@ impl KioskApp {
             _ => 0,
         };
         let expires_too_soon = invoice.expires_at_unix_seconds < required_expiration;
-        let qr = QrData::new(invoice.bolt11.as_bytes());
+        let qr = RasterQr::new(invoice.bolt11.as_bytes(), INVOICE_QR_SIDE);
         if let Err(error) = self.engine.lightning_invoice_created(id, invoice) {
             self.show_persistent_notice(error.to_string(), NoticeSeverity::Error);
             return;
@@ -1584,7 +1595,7 @@ impl KioskApp {
         mdb_request: Option<MdbVendRequest>,
     ) {
         let invoice = simulated_invoice(transaction_id);
-        let qr = match QrData::new(invoice.bolt11.as_bytes()) {
+        let qr = match RasterQr::new(invoice.bolt11.as_bytes(), INVOICE_QR_SIDE) {
             Ok(qr) => qr,
             Err(error) => {
                 let _ = self.engine.vend_cancelled(transaction_id);
@@ -2162,7 +2173,7 @@ impl KioskApp {
                             .into()
                     },
                     |qr| {
-                        container(qr_code(qr).total_size(340))
+                        container(image(qr.handle()).filter_method(image::FilterMethod::Nearest))
                             .padding(10)
                             .style(container::rounded_box)
                             .into()
@@ -2173,8 +2184,17 @@ impl KioskApp {
                     text("Scan with LightningVEND Manager. A matching confirmation code will appear on both screens.")
                         .size(17),
                     visual,
-                    text(format!("Pairing payload ready · {} bytes", pairing_payload.len()))
-                        .size(13)
+                    row![
+                        text(format!("Pairing payload ready · {} bytes", pairing_payload.len()))
+                            .size(13)
+                            .width(Length::Fill),
+                        button("Copy pairing payload")
+                            .padding(10)
+                            .on_press(Message::CopyPairingPayload)
+                    ]
+                    .align_y(iced::Alignment::Center)
+                    .spacing(12)
+                    .width(360)
                 ]
                 .align_x(iced::Alignment::Center)
                 .spacing(16)
@@ -2489,7 +2509,7 @@ impl KioskApp {
         price: Msats,
         started: Instant,
         confirming_exit: bool,
-        qr: &'a QrData,
+        qr: &'a RasterQr,
     ) -> Element<'a, Message> {
         let remaining = LIGHTNING_TIMEOUT
             .saturating_sub(self.now.saturating_duration_since(started))
@@ -2547,7 +2567,7 @@ impl KioskApp {
                 format_sats(price)
             ))
             .size(19),
-            container(qr_code(qr).total_size(290))
+            container(image(qr.handle()).filter_method(image::FilterMethod::Nearest))
                 .padding(5)
                 .style(container::rounded_box),
             text(format!("{remaining} seconds remaining")).size(18),

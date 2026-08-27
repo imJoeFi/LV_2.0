@@ -14,6 +14,7 @@ iced.workspace = true
 image.workspace = true
 iroh.workspace = true
 lv-core.workspace = true
+lv-ui.workspace = true
 lv-vendimint.workspace = true
 nokhwa.workspace = true
 rqrr.workspace = true

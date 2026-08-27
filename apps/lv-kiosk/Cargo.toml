@@ -16,6 +16,7 @@ iced.workspace = true
 image.workspace = true
 lv-core.workspace = true
 lv-mdb.workspace = true
+lv-ui.workspace = true
 lv-vendimint.workspace = true
 redb.workspace = true
 serde.workspace = true

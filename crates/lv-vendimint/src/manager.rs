@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
-use vendimint::Manager;
+use vendimint::{Manager, MintVersion};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
@@ -190,7 +190,7 @@ pub enum ManagerControllerEvent {
         msats: u64,
     },
     FederationStatusUpdated {
-        federation_ids: Vec<String>,
+        federations: Vec<FederationStatus>,
     },
     FundsExported(Vec<EcashExport>),
     FundsExportFailed(String),
@@ -224,6 +224,14 @@ pub struct EcashExport {
     pub federation_id: String,
     pub amount_msats: u64,
     pub token: String,
+    pub mint_version: MintVersion,
+    pub reclaims_automatically: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationStatus {
+    pub federation_id: String,
+    pub mint_version: Option<MintVersion>,
 }
 
 enum ManagerControllerCommand {
@@ -243,7 +251,8 @@ struct ObservedManagerState {
     errors: HashMap<EndpointId, String>,
     event_sequences: HashMap<EndpointId, EventSequence>,
     balance_msats: Option<u64>,
-    federation_ids: Vec<String>,
+    balance_error: Option<String>,
+    federations: Vec<FederationStatus>,
 }
 
 impl ObservedManagerState {
@@ -254,7 +263,8 @@ impl ObservedManagerState {
             errors: HashMap::new(),
             event_sequences: HashMap::new(),
             balance_msats: None,
-            federation_ids: Vec::new(),
+            balance_error: None,
+            federations: Vec::new(),
         }
     }
 }
@@ -405,12 +415,23 @@ async fn refresh_manager_state(
     events: &mpsc::UnboundedSender<ManagerControllerEvent>,
     observed: &mut ObservedManagerState,
 ) {
-    let balance_msats = manager.get_local_balance().await.msats;
-    if observed.balance_msats != Some(balance_msats) {
-        observed.balance_msats = Some(balance_msats);
-        let _ = events.send(ManagerControllerEvent::BalanceUpdated {
-            msats: balance_msats,
-        });
+    match manager.get_local_balance().await {
+        Ok(balance) => {
+            observed.balance_error = None;
+            if observed.balance_msats != Some(balance.msats) {
+                observed.balance_msats = Some(balance.msats);
+                let _ = events.send(ManagerControllerEvent::BalanceUpdated {
+                    msats: balance.msats,
+                });
+            }
+        }
+        Err(error) => {
+            let error = error.to_string();
+            if observed.balance_error.as_ref() != Some(&error) {
+                eprintln!("could not refresh the Vendimint manager balance: {error}");
+                observed.balance_error = Some(error);
+            }
+        }
     }
     let Ok(mut machines) = manager.list_machine_ids().await else {
         return;
@@ -462,14 +483,20 @@ async fn refresh_federation_status(
     let Ok(federations) = configured_federations(manager).await else {
         return;
     };
-    let mut federation_ids = federations
-        .iter()
-        .map(|invite| invite.federation_id().to_string())
-        .collect::<Vec<_>>();
-    federation_ids.sort_unstable();
-    if federation_ids != observed.federation_ids {
-        observed.federation_ids.clone_from(&federation_ids);
-        let _ = events.send(ManagerControllerEvent::FederationStatusUpdated { federation_ids });
+    let mut statuses = Vec::with_capacity(federations.len());
+    for invite in federations {
+        let federation_id = invite.federation_id();
+        statuses.push(FederationStatus {
+            federation_id: federation_id.to_string(),
+            mint_version: manager.get_mint_version(federation_id).await,
+        });
+    }
+    statuses.sort_unstable_by(|left, right| left.federation_id.cmp(&right.federation_id));
+    if statuses != observed.federations {
+        observed.federations.clone_from(&statuses);
+        let _ = events.send(ManagerControllerEvent::FederationStatusUpdated {
+            federations: statuses,
+        });
     }
 }
 
@@ -490,6 +517,8 @@ async fn export_funds(manager: &Manager, events: &mpsc::UnboundedSender<ManagerC
                     federation_id: federation_id.to_string(),
                     amount_msats: notes.total_amount().msats,
                     token: notes.to_string(),
+                    mint_version: notes.mint_version(),
+                    reclaims_automatically: notes.reclaims_automatically(),
                 });
             }
         }

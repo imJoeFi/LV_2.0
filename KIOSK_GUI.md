@@ -118,15 +118,25 @@ cargo run --release --bin lv-manager -- --data data/vendimint-manager
 ```
 
 The manager scans the kiosk QR with the MacBook camera (manual paste remains a
-fallback), performs the physical claim-PIN confirmation, configures the
-federation, and exposes remote inventory, health, vend authorization, and
-assistance controls. macOS may ask the terminal or packaged application for
-camera access the first time the scanner opens.
+fallback through the kiosk's **Copy pairing payload** action), performs the
+physical claim-PIN confirmation, configures the federation, and exposes remote
+inventory, health, vend authorization, and assistance controls. macOS may ask
+the terminal or packaged application for camera access the first time the
+scanner opens.
+
+Pairing, invoice, and ecash-export QRs use the shared `lv-ui` raster renderer.
+It always produces a standard black-on-white square with integer-sized modules
+and a four-module quiet zone, independent of the Iced theme, display scale, or
+Tiny-Skia canvas transforms.
 
 The manager also shows its exact millisatoshi wallet balance. **Export funds**
 creates self-contained bearer ecash as QR and copyable text after an explicit
-confirmation. The token must be claimed within 24 hours; otherwise Vendimint
-reclaims the unclaimed notes into the manager wallet.
+confirmation. Vendimint supports both mint generations and chooses mint v2 for
+a newly joined federation that advertises both; wallets created by earlier
+Vendimint versions remain pinned to mint v1. The manager displays the selected
+version. Unclaimed mint-v1 exports are reclaimed after 24 hours. Mint-v2
+exports do not support automatic reclaim, so their bearer tokens must be kept
+safe until they have been claimed.
 
 ### Promo exercise
 

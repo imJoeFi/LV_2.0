@@ -8,7 +8,7 @@ use lv_core::{
     ManagerRequest, ManagerResponse, PersistentState, SelectionOutcome, SlotId, StateRevision,
     TransactionStatus,
 };
-use lv_vendimint::{request, Machine, MachineState, Manager, ManagerProtocolHandler};
+use lv_vendimint::{request, Machine, MachineState, Manager, ManagerProtocolHandler, MintVersion};
 use std::{
     num::NonZeroUsize,
     path::Path,
@@ -48,6 +48,11 @@ async fn main() -> anyhow::Result<()> {
             let scenario = async {
                 pair(&machine, &manager).await?;
                 manager.update_federation(invite_code.clone()).await?;
+                ensure!(
+                    manager.get_mint_version(invite_code.federation_id()).await
+                        == Some(MintVersion::V2),
+                    "a fresh dual-module wallet did not select mint v2"
+                );
                 wait_until_configured(&machine, &invite_code).await?;
 
                 let machine_ids = wait_for_claimed_machine(&manager).await?;
@@ -211,7 +216,7 @@ async fn pay_vend_and_sweep(
         )
     }));
 
-    let swept = timeout(PAYMENT_TIMEOUT, async {
+    let export = timeout(PAYMENT_TIMEOUT, async {
         loop {
             if let Some(notes) = manager
                 .sweep_all_ecash_notes(
@@ -223,13 +228,22 @@ async fn pay_vend_and_sweep(
                 .await
                 .context("manager could not sweep the funded invoice")?
             {
-                return Ok::<Amount, anyhow::Error>(notes.total_amount());
+                return Ok::<_, anyhow::Error>(notes);
             }
             sleep(STATE_POLL_INTERVAL).await;
         }
     })
     .await
     .context("timed out waiting for the manager to sweep the payment")??;
+    ensure!(
+        export.mint_version() == MintVersion::V2,
+        "manager exported the payment with an unexpected mint generation"
+    );
+    ensure!(
+        !export.reclaims_automatically(),
+        "mint-v2 export unexpectedly advertised automatic reclaim"
+    );
+    let swept = export.total_amount();
     ensure!(swept > Amount::ZERO, "manager swept an empty payment");
     ensure!(
         swept <= TEST_PAYMENT,

@@ -1,9 +1,7 @@
 mod scanner;
 
 use clap::Parser;
-use iced::widget::{
-    button, column, container, image, qr_code, row, scrollable, text, text_input, Column,
-};
+use iced::widget::{button, column, container, image, row, scrollable, text, text_input, Column};
 use iced::{time, window, Element, Length, Size, Subscription, Task, Theme};
 use iroh::{EndpointAddr, EndpointId};
 use lv_core::{
@@ -11,13 +9,16 @@ use lv_core::{
     ManagerCommand, ManagerEvent, PaymentSummary, PurchaseId, PurchaseSummary,
     PurchaseSummaryState, SlotHealth, SlotId, SlotSnapshot, VendAuthorizationSnapshot,
 };
+use lv_ui::RasterQr;
 use lv_vendimint::{
-    EcashExport, ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
+    EcashExport, FederationStatus, ManagerClaim, ManagerController, ManagerControllerConfig,
+    ManagerControllerEvent, MintVersion,
 };
 use scanner::{QrScanner, ScannerEvent};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ECASH_QR_SIDE: u16 = 240;
 
 #[derive(Debug, Parser)]
 #[command(about = "LightningVEND manager UI")]
@@ -108,7 +109,7 @@ struct ManagerApp {
     scanner: Option<QrScanner>,
     camera_preview: Option<image::Handle>,
     balance_msats: u64,
-    federation_ids: Vec<String>,
+    federations: Vec<FederationStatus>,
     funds_export: FundsExportState,
 }
 
@@ -121,7 +122,7 @@ enum FundsExportState {
 
 struct RenderedEcashExport {
     export: EcashExport,
-    qr: Option<qr_code::Data>,
+    qr: Option<RasterQr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,7 +182,7 @@ impl ManagerApp {
             scanner: None,
             camera_preview: None,
             balance_msats: 0,
-            federation_ids: Vec::new(),
+            federations: Vec::new(),
             funds_export: FundsExportState::Closed,
         })
     }
@@ -340,15 +341,15 @@ impl ManagerApp {
             ManagerControllerEvent::BalanceUpdated { msats } => {
                 self.balance_msats = msats;
             }
-            ManagerControllerEvent::FederationStatusUpdated { federation_ids } => {
-                self.federation_ids = federation_ids;
+            ManagerControllerEvent::FederationStatusUpdated { federations } => {
+                self.federations = federations;
             }
             ManagerControllerEvent::FundsExported(exports) => {
                 self.funds_export = FundsExportState::Ready(
                     exports
                         .into_iter()
                         .map(|export| RenderedEcashExport {
-                            qr: qr_code::Data::new(export.token.as_bytes()).ok(),
+                            qr: RasterQr::new(export.token.as_bytes(), ECASH_QR_SIDE).ok(),
                             export,
                         })
                         .collect(),
@@ -744,14 +745,20 @@ impl ManagerApp {
     }
 
     fn federation_form(&self) -> Element<'_, Message> {
-        let status = if self.federation_ids.is_empty() {
+        let status = if self.federations.is_empty() {
             "No federation confirmed on a paired kiosk yet.".to_owned()
         } else {
             format!(
                 "Configured: {}",
-                self.federation_ids
+                self.federations
                     .iter()
-                    .map(|id| short_text(id, 16))
+                    .map(|federation| format!(
+                        "{} · {}",
+                        short_text(&federation.federation_id, 16),
+                        federation
+                            .mint_version
+                            .map_or("syncing", mint_version_label)
+                    ))
                     .collect::<Vec<_>>()
                     .join(", ")
             )
@@ -780,7 +787,7 @@ impl ManagerApp {
                     "This will export up to {} from the manager wallet. Anyone with the token can claim it.",
                     format_msats(self.balance_msats)
                 )),
-                text("Claim the token within 24 hours. Unclaimed funds are automatically reclaimed by this manager."),
+                text("Mint v1 exports are reclaimed after 24 hours if unclaimed. Mint v2 exports are not automatically reclaimed; keep each token safe until it is claimed."),
                 row![
                     button("Cancel")
                         .padding(12)
@@ -806,12 +813,28 @@ impl ManagerApp {
                     |cards, (index, rendered)| {
                         let qr: Element<'_, Message> = rendered.qr.as_ref().map_or_else(
                             || text("This token is too large to render as one QR; use Copy token.").into(),
-                            |data| container(qr_code(data).total_size(240)).padding(5).into(),
+                            |qr| {
+                                container(
+                                    image(qr.handle())
+                                        .filter_method(image::FilterMethod::Nearest),
+                                )
+                                .padding(5)
+                                .into()
+                            },
                         );
                         cards.push(
                             container(column![
                                 text(format_msats(rendered.export.amount_msats)).size(20),
                                 text(format!("Federation {}", short_text(&rendered.export.federation_id, 20))).size(13),
+                                text(format!(
+                                    "{} · {}",
+                                    mint_version_label(rendered.export.mint_version),
+                                    if rendered.export.reclaims_automatically {
+                                        "automatic reclaim after 24 hours"
+                                    } else {
+                                        "no automatic reclaim"
+                                    }
+                                )).size(13),
                                 qr,
                                 text_input("Bearer ecash token", &rendered.export.token)
                                     .secure(true)
@@ -1065,6 +1088,13 @@ fn short_text(value: &str, maximum: usize) -> String {
 
 fn format_msats(msats: u64) -> String {
     format!("{msats} msats")
+}
+
+const fn mint_version_label(version: MintVersion) -> &'static str {
+    match version {
+        MintVersion::V1 => "mint v1",
+        MintVersion::V2 => "mint v2",
+    }
 }
 
 fn authorization_text(authorization: Option<&VendAuthorizationSnapshot>) -> String {

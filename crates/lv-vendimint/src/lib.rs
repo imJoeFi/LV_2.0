@@ -25,10 +25,10 @@ pub use kiosk::{
     PaymentControllerStopped, PaymentMachineState,
 };
 pub use manager::{
-    EcashExport, ManagerClaim, ManagerController, ManagerControllerConfig, ManagerControllerEvent,
-    ManagerControllerStopped,
+    EcashExport, FederationStatus, ManagerClaim, ManagerController, ManagerControllerConfig,
+    ManagerControllerEvent, ManagerControllerStopped,
 };
-pub use vendimint::{Machine, MachineBuilder, MachineState, Manager};
+pub use vendimint::{Machine, MachineBuilder, MachineState, Manager, MintVersion};
 
 const MAX_FRAME_BYTES: usize = 1024 * 1024;
 

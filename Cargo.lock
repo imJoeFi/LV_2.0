@@ -3790,6 +3790,60 @@ dependencies = [
 ]
 
 [[package]]
+name = "fedimint-mintv2-client"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee310f0035064b76a9e44c015df6134df22f097962374533e2bbd19fbd77bbc1"
+dependencies = [
+ "anyhow",
+ "aquamarine 0.5.0",
+ "async-channel",
+ "async-stream",
+ "async-trait",
+ "bitcoin_hashes",
+ "bls12_381",
+ "erased-serde",
+ "fedimint-api-client",
+ "fedimint-client",
+ "fedimint-client-module",
+ "fedimint-core",
+ "fedimint-derive-secret",
+ "fedimint-eventlog",
+ "fedimint-logging",
+ "fedimint-mintv2-common",
+ "fedimint-tbs",
+ "fedimint-threshold-crypto",
+ "futures",
+ "hex",
+ "itertools 0.14.0",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "serdect",
+ "strum 0.27.2",
+ "strum_macros 0.27.2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+]
+
+[[package]]
+name = "fedimint-mintv2-common"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "578e0eb897b26698e07cf0e90f1841a89b3f0d2b96c1b23e55abed70d5c8558f"
+dependencies = [
+ "anyhow",
+ "bitcoin_hashes",
+ "fedimint-core",
+ "fedimint-tbs",
+ "serde",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "fedimint-portalloc"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4194,12 +4248,6 @@ dependencies = [
  "crc32fast",
  "miniz_oxide",
 ]
-
-[[package]]
-name = "float_next_after"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fluid-let"
@@ -5311,7 +5359,6 @@ dependencies = [
  "image",
  "kamadak-exif",
  "log",
- "lyon_path",
  "raw-window-handle",
  "rustc-hash 2.1.3",
  "thiserror 2.0.20",
@@ -5386,7 +5433,6 @@ dependencies = [
  "iced_debug",
  "iced_graphics",
  "log",
- "lyon",
  "rustc-hash 2.1.3",
  "thiserror 2.0.20",
  "wgpu",
@@ -5401,7 +5447,6 @@ dependencies = [
  "iced_renderer",
  "log",
  "num-traits",
- "qrcode",
  "rustc-hash 2.1.3",
  "thiserror 2.0.20",
  "unicode-segmentation",
@@ -7155,6 +7200,7 @@ dependencies = [
  "image",
  "lv-core",
  "lv-mdb",
+ "lv-ui",
  "lv-vendimint",
  "redb 4.1.0",
  "serde",
@@ -7173,6 +7219,7 @@ dependencies = [
  "image",
  "iroh 0.97.0",
  "lv-core",
+ "lv-ui",
  "lv-vendimint",
  "nokhwa",
  "rqrr",
@@ -7189,6 +7236,16 @@ dependencies = [
  "tokio",
  "tokio-serial",
  "uuid",
+]
+
+[[package]]
+name = "lv-ui"
+version = "0.1.0"
+dependencies = [
+ "iced",
+ "image",
+ "qrcode",
+ "rqrr",
 ]
 
 [[package]]
@@ -7212,58 +7269,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "vendimint",
-]
-
-[[package]]
-name = "lyon"
-version = "1.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd0578bdecb7d6d88987b8b2b1e3a4e2f81df9d0ece1078623324a567904e7b7"
-dependencies = [
- "lyon_algorithms",
- "lyon_tessellation",
-]
-
-[[package]]
-name = "lyon_algorithms"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8575c0d003ae459399623c4def180c63b77f343b1a7fee64f249b349e7699a31"
-dependencies = [
- "lyon_path",
- "num-traits",
-]
-
-[[package]]
-name = "lyon_geom"
-version = "1.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4336502e29e32af93cf2dad2214ed6003c17ceb5bd499df77b1de663b9042b92"
-dependencies = [
- "arrayvec",
- "euclid",
- "num-traits",
-]
-
-[[package]]
-name = "lyon_path"
-version = "1.0.19"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c463f9c428b7fc5ec885dcd39ce4aa61e29111d0e33483f6f98c74e89d8621e"
-dependencies = [
- "lyon_geom",
- "num-traits",
-]
-
-[[package]]
-name = "lyon_tessellation"
-version = "1.0.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e43b7e44161571868f5c931d12583592c223c5583eef86b08aa02b7048a3552"
-dependencies = [
- "float_next_after",
- "lyon_path",
- "num-traits",
 ]
 
 [[package]]
@@ -13478,7 +13483,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vendimint"
 version = "0.0.9"
-source = "git+https://github.com/lightningvend/vendimint.git?rev=97eaf87fceba02de5b4e54ad3887d3cbffbbfe9b#97eaf87fceba02de5b4e54ad3887d3cbffbbfe9b"
+source = "git+https://github.com/lightningvend/vendimint.git?rev=0002ce1facdcb68dd6020f4f5884272efa61435d#0002ce1facdcb68dd6020f4f5884272efa61435d"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
@@ -13493,6 +13498,7 @@ dependencies = [
  "fedimint-lnv2-common",
  "fedimint-lnv2-remote-client",
  "fedimint-mint-client",
+ "fedimint-mintv2-client",
  "fedimint-rocksdb",
  "futures-util",
  "iroh 0.97.0",

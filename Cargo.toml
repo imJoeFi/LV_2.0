@@ -5,6 +5,7 @@ members = [
     "apps/lv-manager",
     "crates/lv-core",
     "crates/lv-mdb",
+    "crates/lv-ui",
     "crates/lv-vendimint",
     "tools/lv-e2e-tests",
     "tools/mdb-flow-test",
@@ -34,17 +35,19 @@ fedimint-core = "0.11.1"
 fedimint-lnv2-common = "0.11.1"
 fedimint-lnv2-remote-client = "0.0.7"
 hex = "0.4.3"
-iced = { version = "0.14", default-features = false, features = ["advanced", "image-without-codecs", "qr_code", "thread-pool", "tiny-skia", "tokio", "wayland", "x11"] }
+iced = { version = "0.14", default-features = false, features = ["advanced", "image-without-codecs", "thread-pool", "tiny-skia", "tokio", "wayland", "x11"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 iroh = "0.97.0"
 lightning-invoice = "0.33.3"
 libsqlite3-sys = { version = "0.35", features = ["bundled"] }
 lv-core = { path = "crates/lv-core" }
 lv-mdb = { path = "crates/lv-mdb" }
+lv-ui = { path = "crates/lv-ui" }
 lv-vendimint = { path = "crates/lv-vendimint" }
 nix = { version = "0.31.3", features = ["poll", "term"] }
 parse_int = "0.9.0"
 pkcs8 = "=0.11.0-rc.11"
+qrcode = { version = "0.13", default-features = false }
 redb = "4.1"
 rand_core = { version = "0.6", features = ["getrandom"] }
 rqrr = "0.10.1"
@@ -58,7 +61,7 @@ tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "sy
 tokio-serial = { version = "5", default-features = false }
 toml = "0.9"
 uuid = { version = "1", features = ["serde", "v4"] }
-vendimint = { git = "https://github.com/lightningvend/vendimint.git", rev = "97eaf87fceba02de5b4e54ad3887d3cbffbbfe9b" }
+vendimint = { git = "https://github.com/lightningvend/vendimint.git", rev = "0002ce1facdcb68dd6020f4f5884272efa61435d" }
 zeroize = { version = "1", features = ["derive"] }
 
 [workspace.dependencies.nokhwa]
