@@ -3,5 +3,6 @@
 .env
 __pycache__/
 target/
+target-nix/
 /*.redb
 /*.redb-lock

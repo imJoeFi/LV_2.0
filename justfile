@@ -16,5 +16,13 @@ build-pi:
 # Check, lint, and test every crate in the workspace.
 check:
     cargo fmt --all --check
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
-    cargo test --workspace --all-targets --all-features
+    cargo clippy --workspace --exclude lv-e2e-tests --all-targets --all-features -- -D warnings
+    cargo test --workspace --exclude lv-e2e-tests --all-targets --all-features
+
+# Start an ephemeral regtest federation and run the system integration test.
+test-e2e:
+    nix develop .#e2e --command just _test-e2e
+
+[private]
+_test-e2e:
+    cargo run --locked -p lv-e2e-tests

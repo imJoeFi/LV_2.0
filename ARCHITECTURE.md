@@ -11,6 +11,7 @@ integration, and the two Iced applications can evolve independently.
 | `lv-kiosk` | Portrait customer/admin Iced UI, redb persistence, and orchestration of the state-owning actors |
 | `lv-manager` | Landscape manager Iced application (initial shell) |
 | `mdb-flow-test` | Hardware qualification utility |
+| `lv-e2e-tests` | Opt-in regtest system tests for Fedimint, Vendimint pairing, and the manager ALPN |
 
 The kiosk process keeps mutable domain state on the Iced thread and gives each
 exclusive I/O resource a dedicated Tokio actor. UI messages, MDB events,

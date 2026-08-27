@@ -134,6 +134,7 @@ impl ManagerProtocolHandler {
 
         write_frame(&mut send, &WireResponse::new(response)).await?;
         send.finish()?;
+        send.stopped().await?;
         Ok(())
     }
 }
@@ -149,6 +150,10 @@ pub async fn request(
     write_frame(&mut send, &WireRequest::new(request)).await?;
     send.finish()?;
     let response: WireResponse = read_frame(&mut receive).await?;
+    let mut trailing = [0_u8; 1];
+    if AsyncReadExt::read(&mut receive, &mut trailing).await? != 0 {
+        return Err(TransportError::TrailingData.into());
+    }
     if response.version != MANAGER_PROTOCOL_VERSION {
         anyhow::bail!(
             "kiosk returned manager protocol version {}; expected {}",
@@ -209,10 +214,14 @@ enum TransportError {
     Connection(#[from] iroh::endpoint::ConnectionError),
     #[error("manager RPC stream closed before completion: {0}")]
     ClosedStream(#[from] iroh::endpoint::ClosedStream),
+    #[error("manager RPC response was not acknowledged: {0}")]
+    Stopped(#[from] iroh::endpoint::StoppedError),
     #[error("manager RPC frame could not be encoded or decoded: {0}")]
     Json(#[from] serde_json::Error),
     #[error("manager RPC frame is {actual} bytes; maximum is {maximum}")]
     FrameTooLarge { actual: usize, maximum: usize },
+    #[error("manager RPC response contained data after its frame")]
+    TrailingData,
     #[error("the kiosk state actor is unavailable")]
     KioskUnavailable,
 }

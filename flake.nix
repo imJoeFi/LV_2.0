@@ -2,6 +2,8 @@
   description = "Development and Raspberry Pi cross-compilation environment for LV 2.0";
 
   inputs = {
+    fedimint.url = "github:fedimint/fedimint?rev=2620789610a2c65c1068de973ebb5657d08d549d";
+
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     rust-overlay = {
@@ -11,7 +13,7 @@
   };
 
   outputs =
-    { nixpkgs, rust-overlay, ... }:
+    { fedimint, nixpkgs, rust-overlay, ... }:
     let
       supportedSystems = [
         "aarch64-darwin"
@@ -48,6 +50,15 @@
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
+
+          e2e = fedimint.devShells.${system}.default.overrideAttrs (old: {
+            nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [
+              fedimint.packages.${system}.devimint
+              fedimint.packages.${system}.fedimint-pkgs
+              fedimint.packages.${system}.gateway-pkgs
+              pkgs.just
+            ];
+          });
         }
       );
     };
