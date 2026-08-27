@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
-pub const MANAGER_ALPN: &[u8] = b"lightningvend/manager/1";
-pub const MANAGER_PROTOCOL_VERSION: u16 = 1;
+pub const MANAGER_ALPN: &[u8] = b"lightningvend/manager/2";
+pub const MANAGER_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -14,7 +14,7 @@ pub struct EventSequence(pub u64);
 #[serde(transparent)]
 pub struct StateRevision(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CommandId(Uuid);
 
@@ -37,7 +37,7 @@ pub struct AdminPin(String);
 impl AdminPin {
     pub fn parse(pin: impl Into<String>) -> Result<Self, AdminPinError> {
         let pin = pin.into();
-        if pin.len() >= 4 && pin.bytes().all(|byte| byte.is_ascii_digit()) {
+        if (4..=12).contains(&pin.len()) && pin.bytes().all(|byte| byte.is_ascii_digit()) {
             Ok(Self(pin))
         } else {
             Err(AdminPinError)
@@ -60,7 +60,7 @@ pub struct AdminPinError;
 
 impl fmt::Display for AdminPinError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("admin PIN must contain at least four digits")
+        formatter.write_str("admin PIN must contain between four and twelve digits")
     }
 }
 
@@ -185,12 +185,26 @@ pub struct SlotSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VendAuthorizationSnapshot {
+    FreeVend {
+        scope: FreeVendScope,
+        expires_at_unix_millis: Option<u64>,
+    },
+    MaintenanceVend {
+        slot: SlotId,
+        expires_at_unix_millis: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KioskSnapshot {
     pub name: Option<String>,
+    pub admin_pin_configured: bool,
     pub revision: StateRevision,
     pub through_sequence: EventSequence,
     pub slots: Vec<SlotSnapshot>,
     pub unresolved_purchases: Vec<PurchaseSummary>,
+    pub vend_authorization: Option<VendAuthorizationSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,6 +286,14 @@ mod tests {
         let pin = AdminPin::parse("1234").unwrap();
         assert_eq!(format!("{pin:?}"), "AdminPin([REDACTED])");
         assert!(!format!("{pin:?}").contains("1234"));
+    }
+
+    #[test]
+    fn admin_pin_length_matches_the_kiosk_keypad() {
+        assert!(AdminPin::parse("1234").is_ok());
+        assert!(AdminPin::parse("123456789012").is_ok());
+        assert!(AdminPin::parse("123").is_err());
+        assert!(AdminPin::parse("1234567890123").is_err());
     }
 
     #[test]

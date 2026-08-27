@@ -3,9 +3,12 @@ use bitcoin::Network;
 use fedimint_core::{invite_code::InviteCode, Amount};
 use fedimint_lnv2_common::Bolt11InvoiceDescription;
 use fedimint_lnv2_remote_client::FinalRemoteReceiveOperationState;
-use lv_core::{ManagerRequest, ManagerResponse};
+use lv_core::{
+    Catalog, CommandEnvelope, CommandId, CommandResult, KioskEngine, ManagerCommand, ManagerEvent,
+    ManagerRequest, ManagerResponse, PersistentState, SlotId, StateRevision,
+};
 use lv_vendimint::{request, Machine, MachineState, Manager, ManagerProtocolHandler};
-use std::{num::NonZeroUsize, time::Duration};
+use std::{num::NonZeroUsize, path::Path, str::FromStr, time::Duration};
 use tokio::time::{sleep, timeout};
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -46,8 +49,7 @@ async fn main() -> anyhow::Result<()> {
                     machine_ids.len() == 1,
                     "manager did not retain exactly one machine"
                 );
-                round_trip_manager_request(&manager, &machine_ids[0], &mut manager_requests)
-                    .await?;
+                exercise_manager_service(&manager, &machine_ids[0], &mut manager_requests).await?;
                 pay_and_sweep(&dev_fed, &machine, &manager, &invite_code).await
             }
             .await;
@@ -195,33 +197,111 @@ async fn wait_for_claimed_machine(manager: &Manager) -> anyhow::Result<Vec<iroh:
     .context("timed out waiting for the claimed machine to sync to the manager")?
 }
 
-async fn round_trip_manager_request(
+async fn exercise_manager_service(
     manager: &Manager,
     machine_id: &iroh::EndpointId,
     requests: &mut lv_vendimint::ManagerRequestReceiver,
 ) -> anyhow::Result<()> {
-    let expected = ManagerResponse::ProtocolError {
-        message: "E2E transport smoke response".to_owned(),
+    let catalog = Catalog::parse(
+        r#"
+            [[products]]
+            id = "water"
+            name = "Sparkling Water"
+
+            [[slots]]
+            id = "A1"
+            product = "water"
+            payment = "promo"
+        "#,
+        Path::new("."),
+    )?;
+    let mut kiosk = KioskEngine::new(catalog, PersistentState::default());
+    kiosk.synchronize_manager_events();
+
+    let initial = call_manager_service(
+        manager,
+        machine_id,
+        requests,
+        &mut kiosk,
+        ManagerRequest::GetSnapshot,
+    )
+    .await?;
+    let ManagerResponse::Snapshot(initial) = initial else {
+        anyhow::bail!("manager service did not return its initial snapshot");
     };
-    let client = request(manager, machine_id, ManagerRequest::GetSnapshot);
+    ensure!(initial.revision == StateRevision(0));
+
+    let command_id = CommandId::new();
+    let command = ManagerRequest::Command(CommandEnvelope {
+        id: command_id,
+        command: ManagerCommand::SetInventory {
+            slot: SlotId::from_str("A1")?,
+            quantity: 7,
+            expected_revision: initial.revision,
+        },
+    });
+    let applied =
+        call_manager_service(manager, machine_id, requests, &mut kiosk, command.clone()).await?;
+    ensure!(matches!(
+        applied,
+        ManagerResponse::CommandResult {
+            command_id: returned_id,
+            result: CommandResult::Applied {
+                revision: StateRevision(1)
+            },
+        } if returned_id == command_id
+    ));
+    let repeated = call_manager_service(manager, machine_id, requests, &mut kiosk, command).await?;
+    ensure!(repeated == applied, "command retry was not idempotent");
+
+    let events = call_manager_service(
+        manager,
+        machine_id,
+        requests,
+        &mut kiosk,
+        ManagerRequest::SubscribeEvents {
+            after: initial.through_sequence,
+        },
+    )
+    .await?;
+    let ManagerResponse::Events(events) = events else {
+        anyhow::bail!("manager service did not return its event stream");
+    };
+    ensure!(matches!(
+        events.as_slice(),
+        [event]
+            if matches!(
+                &event.event,
+                ManagerEvent::InventorySet { slot, quantity }
+                    if slot.as_str() == "A1" && *quantity == 7
+            )
+    ));
+    Ok(())
+}
+
+async fn call_manager_service(
+    manager: &Manager,
+    machine_id: &iroh::EndpointId,
+    requests: &mut lv_vendimint::ManagerRequestReceiver,
+    kiosk: &mut KioskEngine,
+    manager_request: ManagerRequest,
+) -> anyhow::Result<ManagerResponse> {
+    let client = request(manager, machine_id, manager_request.clone());
     let server = async {
         let incoming = timeout(EVENT_TIMEOUT, requests.recv())
             .await
             .context("timed out waiting for the authenticated manager request")?
             .context("manager request channel closed unexpectedly")?;
         ensure!(
-            incoming.request() == &ManagerRequest::GetSnapshot,
+            incoming.request() == &manager_request,
             "manager request changed during transport"
         );
+        let response = kiosk.handle_manager_request(incoming.request().clone());
         incoming
-            .respond(expected.clone())
+            .respond(response)
             .map_err(|_| anyhow::anyhow!("manager response receiver was dropped"))?;
         Ok::<(), anyhow::Error>(())
     };
     let (response, ()) = tokio::try_join!(client, server)?;
-    ensure!(
-        response == expected,
-        "manager response changed during transport"
-    );
-    Ok(())
+    Ok(response)
 }

@@ -16,8 +16,8 @@ use lv_core::{
 };
 use lv_mdb::{ItemNumber, Level1Amount, MdbConfig, SessionEndReason, VendDecisionError, VendId};
 use lv_vendimint::{
-    ClaimRequest, PaymentController, PaymentControllerConfig, PaymentControllerEvent,
-    PaymentMachineState,
+    ClaimRequest, IncomingManagerRequest, PaymentController, PaymentControllerConfig,
+    PaymentControllerEvent, PaymentMachineState,
 };
 use mdb::{ControllerEvent, DecisionFailure, MdbController};
 use notice::{Notice, NoticeBanner, NoticeSeverity};
@@ -367,7 +367,8 @@ impl KioskApp {
                 state.set_health(slot.id().clone(), SlotHealth::Ready);
             }
         }
-        let engine = KioskEngine::new(catalog, state);
+        let mut engine = KioskEngine::new(catalog, state);
+        engine.synchronize_manager_events();
         store
             .save(engine.state())
             .map_err(|error| error.to_string())?;
@@ -486,11 +487,7 @@ impl KioskApp {
                 self.notice.clear();
             }
             Message::SubmitAdmin => self.submit_admin_pin(),
-            Message::CloseAdmin => {
-                self.engine.disarm();
-                self.page = Page::Ready;
-                self.notice.clear();
-            }
+            Message::CloseAdmin => self.close_admin(),
             Message::MachineSelected(slot) => self.machine_selected(&slot, None),
             Message::LightningAccepted(id) => self.lightning_accepted(id),
             Message::RequestLightningExit(id) => self.request_lightning_exit(id),
@@ -508,6 +505,7 @@ impl KioskApp {
             }
             Message::ArmFreeVend => {
                 self.engine.arm_free_vend();
+                self.persist();
                 self.show_transient_notice(
                     "Free vend armed for the next configured, available selection.",
                     NoticeSeverity::Info,
@@ -515,12 +513,14 @@ impl KioskApp {
             }
             Message::Disarm => {
                 self.engine.disarm();
+                self.persist();
                 self.show_transient_notice("Vend authorization disarmed.", NoticeSeverity::Info);
             }
             Message::ArmMaintenance(slot) => {
                 if let Err(error) = self.engine.arm_maintenance_test(slot.clone()) {
                     self.show_transient_notice(error.to_string(), NoticeSeverity::Warning);
                 } else {
+                    self.persist();
                     self.show_transient_notice(
                         format!("Maintenance test armed. Enter {slot} on the vending machine."),
                         NoticeSeverity::Info,
@@ -638,15 +638,38 @@ impl KioskApp {
                 expired_at_unix_millis,
             } => self.payment_invoice_expired(purchase_id, expired_at_unix_millis),
             PaymentControllerEvent::ManagerRequest(request) => {
-                let _ = request.respond(ManagerResponse::ProtocolError {
-                    message: "manager state commands are not enabled in this kiosk build"
-                        .to_owned(),
-                });
+                self.handle_manager_request(request);
             }
             PaymentControllerEvent::Unavailable(error) => {
                 self.payment_status = PaymentStatus::Unavailable(error);
             }
         }
+    }
+
+    fn handle_manager_request(&mut self, request: IncomingManagerRequest) {
+        let manager_request = request.request().clone();
+        let response = if matches!(&manager_request, lv_core::ManagerRequest::Command(_)) {
+            let mut candidate = self.engine.clone();
+            let response = candidate.handle_manager_request(manager_request);
+            match self.store.save(candidate.state()) {
+                Ok(()) => {
+                    self.engine = candidate;
+                    response
+                }
+                Err(error) => {
+                    self.show_persistent_notice(
+                        format!("Could not save a manager command: {error}"),
+                        NoticeSeverity::Error,
+                    );
+                    ManagerResponse::ProtocolError {
+                        message: "the kiosk could not durably save the command".to_owned(),
+                    }
+                }
+            }
+        } else {
+            self.engine.handle_manager_request(manager_request)
+        };
+        let _ = request.respond(response);
     }
 
     fn payment_invoice_created(&mut self, id: TransactionId, invoice: LightningInvoice) {
@@ -1089,6 +1112,15 @@ impl KioskApp {
     fn tick(&mut self, now: Instant) {
         self.now = now;
         self.notice.expire(now);
+        if self.engine.expire_vend_authorization(unix_millis_now()) {
+            self.persist();
+            if matches!(self.page, Page::Admin) {
+                self.show_transient_notice(
+                    "Vend authorization expired and was disarmed.",
+                    NoticeSeverity::Info,
+                );
+            }
+        }
         if self.expire_pending_promo_selection() {
             return;
         }
@@ -1219,7 +1251,12 @@ impl KioskApp {
             );
             return;
         }
-        if self.admin_input == self.admin_pin {
+        let expected_pin = self
+            .engine
+            .state()
+            .admin_pin()
+            .map_or(self.admin_pin.as_str(), lv_core::AdminPin::expose);
+        if self.admin_input == expected_pin {
             self.invalid_admin_attempts = 0;
             self.admin_locked_until = None;
             self.admin_input.clear();
@@ -1240,6 +1277,13 @@ impl KioskApp {
                 self.show_transient_notice("Incorrect admin PIN.", NoticeSeverity::Warning);
             }
         }
+    }
+
+    fn close_admin(&mut self) {
+        self.engine.disarm();
+        self.persist();
+        self.page = Page::Ready;
+        self.notice.clear();
     }
 
     fn finish_customer_session(&mut self, timed_out: bool) {
@@ -1793,8 +1837,13 @@ impl KioskApp {
     }
 
     fn persist(&mut self) -> bool {
-        match self.store.save(self.engine.state()) {
-            Ok(()) => true,
+        let mut candidate = self.engine.clone();
+        candidate.synchronize_manager_events();
+        match self.store.save(candidate.state()) {
+            Ok(()) => {
+                self.engine = candidate;
+                true
+            }
             Err(error) => {
                 self.show_persistent_notice(
                     format!("Could not save kiosk state: {error}"),
@@ -2428,11 +2477,13 @@ impl KioskApp {
 
         let slot_list = self.admin_slot_list();
         let history = self.admin_history();
+        let kiosk_name = self.engine.state().kiosk_name().unwrap_or("Unnamed kiosk");
         let body = column![
             row![
                 text("Admin").size(30).width(Length::Fill),
                 header_action_button("Exit", Message::CloseAdmin)
             ],
+            text(kiosk_name).size(18),
             self.notice_view(),
             text(arm_status),
             row![arm_button, disarm].spacing(8),
@@ -2853,6 +2904,10 @@ fn unix_seconds_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn unix_millis_now() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default()
 }
 
 fn duration_seconds_ceil(duration: Duration) -> u64 {

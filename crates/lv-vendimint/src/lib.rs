@@ -62,8 +62,8 @@ impl IncomingManagerRequest {
         &self.request
     }
 
-    pub fn respond(self, response: ManagerResponse) -> Result<(), ManagerResponse> {
-        self.response.send(response)
+    pub fn respond(self, response: ManagerResponse) -> Result<(), Box<ManagerResponse>> {
+        self.response.send(response).map_err(Box::new)
     }
 }
 

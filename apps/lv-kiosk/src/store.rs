@@ -8,7 +8,7 @@ use thiserror::Error;
 
 const STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("kiosk_state");
 const STATE_KEY: &str = "persistent_state";
-const STATE_SCHEMA_VERSION: u32 = 1;
+const STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredState {

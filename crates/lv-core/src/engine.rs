@@ -1,11 +1,15 @@
 use super::{
-    AssistanceReason, AssistanceResolution, Catalog, LightningInvoice, LightningPurchase,
-    LightningPurchaseState, Msats, PaymentPolicy, ProductId, PurchaseId, SlotId,
+    AdminPin, AssistanceReason, AssistanceResolution, Catalog, CommandId, CommandResult,
+    EventEnvelope, EventSequence, FreeVendScope, LightningInvoice, LightningPurchase,
+    LightningPurchaseState, Msats, PaymentPolicy, ProductId, PurchaseId, PurchaseSummary, SlotId,
+    StateRevision,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use thiserror::Error;
+
+mod manager;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -227,13 +231,34 @@ impl Transaction {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagerProjection {
+    initialized: bool,
+    inventory: BTreeMap<SlotId, u32>,
+    health: BTreeMap<SlotId, SlotHealth>,
+    purchases: BTreeMap<PurchaseId, PurchaseSummary>,
+    vend_authorization_armed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ManagerState {
+    name: Option<String>,
+    admin_pin: Option<AdminPin>,
+    revision: StateRevision,
+    through_sequence: EventSequence,
+    events: Vec<EventEnvelope>,
+    command_results: BTreeMap<CommandId, CommandResult>,
+    projection: ManagerProjection,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PersistentState {
     inventory: BTreeMap<SlotId, u32>,
     health: BTreeMap<SlotId, SlotHealth>,
     codes: BTreeMap<PromoCode, CodeAccount>,
     transactions: Vec<Transaction>,
     lightning_purchases: BTreeMap<PurchaseId, LightningPurchase>,
+    manager: ManagerState,
 }
 
 impl PersistentState {
@@ -282,16 +307,35 @@ impl PersistentState {
         self.lightning_purchases.get(&id)
     }
 
+    pub fn kiosk_name(&self) -> Option<&str> {
+        self.manager.name.as_deref()
+    }
+
+    pub const fn admin_pin(&self) -> Option<&AdminPin> {
+        self.manager.admin_pin.as_ref()
+    }
+
     pub fn reserved_inventory(&self, slot: &SlotId) -> u32 {
-        u32::try_from(
-            self.lightning_purchases
-                .values()
-                .filter(|purchase| {
-                    purchase.slot == *slot && purchase.state.holds_inventory_reservation()
-                })
-                .count(),
-        )
-        .unwrap_or(u32::MAX)
+        let lightning = self
+            .lightning_purchases
+            .values()
+            .filter(|purchase| {
+                purchase.slot == *slot && purchase.state.holds_inventory_reservation()
+            })
+            .count();
+        let non_lightning = self
+            .transactions
+            .iter()
+            .filter(|transaction| {
+                transaction.slot == *slot
+                    && !matches!(transaction.payment, PaymentKind::Lightning { .. })
+                    && matches!(
+                        transaction.status,
+                        TransactionStatus::AwaitingVend | TransactionStatus::Uncertain
+                    )
+            })
+            .count();
+        u32::try_from(lightning.saturating_add(non_lightning)).unwrap_or(u32::MAX)
     }
 
     pub fn available_inventory(&self, slot: &SlotId) -> u32 {
@@ -428,6 +472,8 @@ pub struct KioskEngine {
     state: PersistentState,
     active_code: Option<PromoCode>,
     arm_mode: ArmMode,
+    free_vend_scope: FreeVendScope,
+    arm_expires_at_unix_millis: Option<u64>,
     active_transaction: Option<TransactionId>,
 }
 
@@ -439,6 +485,8 @@ impl KioskEngine {
             state,
             active_code: None,
             arm_mode: ArmMode::None,
+            free_vend_scope: FreeVendScope::AnyConfiguredSlot,
+            arm_expires_at_unix_millis: None,
             active_transaction: None,
         }
     }
@@ -496,6 +544,8 @@ impl KioskEngine {
 
     pub fn arm_free_vend(&mut self) {
         self.arm_mode = ArmMode::FreeNext;
+        self.free_vend_scope = FreeVendScope::AnyConfiguredSlot;
+        self.arm_expires_at_unix_millis = None;
     }
 
     pub fn arm_maintenance_test(&mut self, slot: SlotId) -> Result<(), KioskError> {
@@ -506,17 +556,24 @@ impl KioskEngine {
             return Err(KioskError::UnresolvedTransaction(slot));
         }
         self.arm_mode = ArmMode::MaintenanceTest(slot);
+        self.arm_expires_at_unix_millis = None;
         Ok(())
     }
 
     pub fn disarm(&mut self) {
         self.arm_mode = ArmMode::None;
+        self.free_vend_scope = FreeVendScope::AnyConfiguredSlot;
+        self.arm_expires_at_unix_millis = None;
     }
 
     pub fn set_inventory(&mut self, slot: SlotId, quantity: u32) -> Result<(), KioskError> {
         self.catalog
             .slot(&slot)
             .ok_or_else(|| KioskError::UnknownSlot(slot.clone()))?;
+        let reserved = self.state.reserved_inventory(&slot);
+        if quantity < reserved {
+            return Err(KioskError::InventoryBelowReservations { slot, reserved });
+        }
         self.state.set_inventory(slot, quantity);
         Ok(())
     }
@@ -546,6 +603,7 @@ impl KioskEngine {
     }
 
     pub fn machine_selected(&mut self, slot_id: &SlotId) -> Result<SelectionOutcome, KioskError> {
+        self.expire_vend_authorization(unix_millis_now());
         if self.active_transaction.is_some() {
             return Ok(SelectionOutcome::Denied(
                 "Another vend is already in progress.".to_owned(),
@@ -555,12 +613,19 @@ impl KioskEngine {
 
         match self.arm_mode.clone() {
             ArmMode::FreeNext => {
+                if let FreeVendScope::SpecificSlot(expected) = &self.free_vend_scope {
+                    if expected != slot_id {
+                        return Ok(SelectionOutcome::Denied(format!(
+                            "Free vend is armed for {expected}, not {slot_id}."
+                        )));
+                    }
+                }
                 if !self.slot_is_available(slot_id)? {
                     return Ok(SelectionOutcome::Denied(
                         "That selection is sold out or temporarily unavailable.".to_owned(),
                     ));
                 }
-                self.arm_mode = ArmMode::None;
+                self.disarm();
                 self.approve(selection, PaymentKind::FreeVend)
             }
             ArmMode::MaintenanceTest(expected) if expected == *slot_id => {
@@ -569,7 +634,7 @@ impl KioskEngine {
                         "Stock this configured slot before running a test vend.".to_owned(),
                     ));
                 }
-                self.arm_mode = ArmMode::None;
+                self.disarm();
                 self.approve(selection, PaymentKind::MaintenanceTest)
             }
             ArmMode::MaintenanceTest(expected) => Ok(SelectionOutcome::Denied(format!(
@@ -1184,6 +1249,8 @@ pub enum KioskError {
     InventoryAlreadyZero(SlotId),
     #[error("slot {0} has no unreserved inventory available")]
     NoAvailableInventory(SlotId),
+    #[error("slot {slot} has {reserved} reserved item(s), so inventory cannot be set lower")]
+    InventoryBelowReservations { slot: SlotId, reserved: u32 },
     #[error("slot {0} has an uncertain transaction that must be reconciled first")]
     UnresolvedTransaction(SlotId),
 }
@@ -1383,6 +1450,11 @@ mod tests {
             .entitlement(&ProductId::parse("water").unwrap())
             .unwrap();
         assert_eq!(entitlement.reserved(), 1);
+        assert_eq!(engine.state().reserved_inventory(&slot), 1);
+        assert!(matches!(
+            engine.set_inventory(slot.clone(), 0),
+            Err(KioskError::InventoryBelowReservations { reserved: 1, .. })
+        ));
         engine.resolve_uncertain(transaction, false).unwrap();
         let entitlement = engine
             .active_account()
@@ -1391,6 +1463,7 @@ mod tests {
             .unwrap();
         assert_eq!(entitlement.reserved(), 0);
         assert_eq!(entitlement.remaining(), 2);
+        assert_eq!(engine.state().reserved_inventory(&slot), 0);
     }
 
     #[test]

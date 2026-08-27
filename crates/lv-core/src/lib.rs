@@ -16,7 +16,8 @@ pub use manager_protocol::{
     AdminPin, AdminPinError, CommandEnvelope, CommandId, CommandResult, EventEnvelope,
     EventSequence, FreeVendScope, KioskSnapshot, ManagerCommand, ManagerEvent, ManagerRequest,
     ManagerResponse, PaymentSummary, PromoAccountRef, PurchaseSummary, PurchaseSummaryState,
-    SlotSnapshot, StateRevision, WireRequest, WireResponse, MANAGER_ALPN, MANAGER_PROTOCOL_VERSION,
+    SlotSnapshot, StateRevision, VendAuthorizationSnapshot, WireRequest, WireResponse,
+    MANAGER_ALPN, MANAGER_PROTOCOL_VERSION,
 };
 pub use money::Msats;
 pub use purchase::{
